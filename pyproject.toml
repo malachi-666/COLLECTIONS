@@ -1,0 +1,24 @@
+[project]
+name = "aether-auditor"
+version = "0.1.0"
+description = "Hardware profile legacy IoT device beacon auditor"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "scapy",
+    "pyyaml",
+    "rich",
+]
+
+[project.scripts]
+aether-audit = "src.ui.dashboard:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

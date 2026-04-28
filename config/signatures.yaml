@@ -1,0 +1,8 @@
+signatures:
+  - device_class: "Legacy_Surveillance_Node"
+    mac_oui: "00:1A:2B"
+    expected_ssid: "FAILOVER_NET_1"
+    signal_threshold_dbm: -75
+  - device_class: "Unsecured_IoT_Controller"
+    mac_oui: "B4:5D:50"
+    signal_threshold_dbm: -80
