@@ -1,5 +1,5 @@
 import threading
-from typing import Optional, Any
+from typing import Optional, Any, Callable, Dict
 
 from scapy.all import sniff, Dot11, Dot11Elt, RadioTap
 
@@ -12,16 +12,18 @@ class TransparencyAuditor:
     Cross-references intercepted metadata against defined hardware signatures.
     """
 
-    def __init__(self, config: AppConfig, logger: AuditLogger) -> None:
+    def __init__(self, config: AppConfig, logger: AuditLogger, on_device_seen: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
         """
         Initializes the TransparencyAuditor.
 
         Args:
             config (AppConfig): The application configuration containing hardware signatures.
             logger (AuditLogger): The thread-safe logger for recording matches.
+            on_device_seen (Callable): Callback fired when a device is seen.
         """
         self.config = config
         self.logger = logger
+        self.on_device_seen = on_device_seen
         self._stop_event = threading.Event()
         self._audit_thread: Optional[threading.Thread] = None
         self.interface: Optional[str] = None
@@ -73,7 +75,12 @@ class TransparencyAuditor:
     def _analyze_signature(self, mac_address: str, ssid: Optional[str], rssi: Optional[int]) -> None:
         """
         Cross-references intercepted metadata against defined hardware signatures.
+        Fires callback for UI updates.
         """
+        is_anomaly = False
+        device_class = "Unknown"
+        threshold = None
+
         for sig in self.config.signatures:
             # Check OUI prefix match
             if mac_address.startswith(sig.mac_oui.upper()):
@@ -85,28 +92,41 @@ class TransparencyAuditor:
                 if rssi is not None and rssi < sig.signal_threshold_dbm:
                     continue
 
-                # Match found, log the event
+                is_anomaly = True
+                device_class = sig.device_class
+                threshold = sig.signal_threshold_dbm
+
+                # Log the confirmed anomaly
                 event_data = {
                     "event_type": "hardware_signature_match",
-                    "device_class": sig.device_class,
+                    "device_class": device_class,
                     "intercepted_mac": mac_address,
                     "intercepted_ssid": ssid,
                     "intercepted_rssi": rssi,
                     "matched_oui": sig.mac_oui,
-                    "threshold_dbm": sig.signal_threshold_dbm
+                    "threshold_dbm": threshold
                 }
                 self.logger.log_event(event_data)
+                break # Matched highest priority first
+
+        # Fire UI callback for all devices seen to build the grid
+        if self.on_device_seen:
+            self.on_device_seen({
+                "mac": mac_address,
+                "ssid": ssid or "<hidden>",
+                "rssi": rssi,
+                "is_anomaly": is_anomaly,
+                "device_class": device_class
+            })
 
     def _sniff_loop(self) -> None:
         """
         The continuous sniffing loop that runs in a daemon thread.
         """
-        # stop_filter tells sniff when to stop
         def stop_filter(p: Any) -> bool:
             return self._stop_event.is_set()
 
         try:
-            # We filter for wlan to be safe, but Dot11 checks inside handler do the heavy lifting
             sniff(iface=self.interface, prn=self._packet_handler, stop_filter=stop_filter, store=0)
         except Exception as e:
             self.logger.log_event({"event_type": "auditor_error", "error": str(e)})
@@ -114,9 +134,6 @@ class TransparencyAuditor:
     def start_audit(self, interface: str) -> None:
         """
         Starts the auditing loop in a background daemon thread.
-
-        Args:
-            interface (str): The wireless interface in monitor mode to sniff on (e.g., 'wlan0mon').
         """
         if self._audit_thread and self._audit_thread.is_alive():
             raise RuntimeError("Audit is already running.")
@@ -133,7 +150,6 @@ class TransparencyAuditor:
         """
         self._stop_event.set()
         if self._audit_thread:
-            # Wait a brief moment for the sniffer to exit cleanly
             self._audit_thread.join(timeout=2.0)
             self._audit_thread = None
         self.interface = None
