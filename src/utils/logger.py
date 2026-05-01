@@ -20,36 +20,36 @@ class AuditLogger:
 
     def _init_db(self):
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS audit_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    hashed_mac TEXT NOT NULL,
-                    ssid TEXT,
-                    rssi INTEGER,
-                    device_class TEXT,
-                    is_hidden BOOLEAN,
-                    is_rapid BOOLEAN
-                )
-            ''')
-            # Create index for fast retention queries
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON audit_logs(timestamp)')
-            conn.commit()
-            conn.close()
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS audit_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        hashed_mac TEXT NOT NULL,
+                        ssid TEXT,
+                        rssi INTEGER,
+                        device_class TEXT,
+                        is_hidden BOOLEAN,
+                        is_rapid BOOLEAN
+                    )
+                ''')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON audit_logs(timestamp)')
+                conn.commit()
+            except sqlite3.Error as e:
+                print(f"[Logger Error] Failed to initialize DB: {e}")
+            finally:
+                if 'conn' in locals():
+                    conn.close()
 
     def _hash_mac(self, mac_address: str) -> str:
-        """Anonymizes the MAC address to comply with data sovereignty laws."""
         if not mac_address:
             return ""
         return hashlib.sha256(mac_address.encode('utf-8')).hexdigest()
 
     def log_event(self, data: dict):
-        """
-        Logs a structured event to SQLite. Enforces anonymization on MAC addresses.
-        """
         timestamp = datetime.now(timezone.utc).isoformat()
 
         event_type = data.get("event_type", "unknown")
@@ -62,20 +62,24 @@ class AuditLogger:
         is_rapid = data.get("is_rapid", False)
 
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            cursor.execute('''
-                INSERT INTO audit_logs (timestamp, event_type, hashed_mac, ssid, rssi, device_class, is_hidden, is_rapid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (timestamp, event_type, hashed_mac, ssid, rssi, device_class, is_hidden, is_rapid))
-            conn.commit()
-            conn.close()
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO audit_logs (timestamp, event_type, hashed_mac, ssid, rssi, device_class, is_hidden, is_rapid)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (timestamp, event_type, hashed_mac, ssid, rssi, device_class, is_hidden, is_rapid))
+                conn.commit()
+            except sqlite3.Error as e:
+                 print(f"[Logger Error] Failed to log event: {e}")
+            finally:
+                if 'conn' in locals():
+                    conn.close()
 
             # Non-blocking retention sweep
             threading.Thread(target=self._enforce_retention, daemon=True).start()
 
     def _enforce_retention(self):
-        """Deletes records older than retention_days."""
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=self.retention_days)).isoformat()
         with self.lock:
             try:
@@ -83,50 +87,48 @@ class AuditLogger:
                 cursor = conn.cursor()
                 cursor.execute('DELETE FROM audit_logs WHERE timestamp < ?', (cutoff_date,))
                 conn.commit()
-                conn.close()
             except sqlite3.Error:
                 pass
+            finally:
+                if 'conn' in locals():
+                    conn.close()
 
-    def export_geojson(self, output_path: str = "map_export.geojson"):
-        """
-        Exports the SQLite database into a GeoJSON format for Leaflet/QGIS.
-        Calculates arbitrary local pseudo-coordinates and includes Heatmap weights based on RSSI.
-        """
+    def export_geojson(self, output_path: str = "map_export.geojson") -> Path:
         BASE_LAT = 38.8977
         BASE_LON = -77.0365
         features = []
 
         with self.lock:
-            conn = sqlite3.connect(self.db_path)
-            # Use GROUP BY to get the latest/strongest signal per unique hashed MAC
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT hashed_mac, MAX(rssi) as max_rssi, MAX(ssid) as ssid, MAX(device_class) as device_class,
-                       MAX(is_hidden) as is_hidden, MAX(is_rapid) as is_rapid
-                FROM audit_logs
-                WHERE event_type = 'hardware_signature_match' AND rssi IS NOT NULL
-                GROUP BY hashed_mac
-            ''')
-            rows = cursor.fetchall()
-            conn.close()
+            try:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT hashed_mac, MAX(rssi) as max_rssi, MAX(ssid) as ssid, MAX(device_class) as device_class,
+                           MAX(is_hidden) as is_hidden, MAX(is_rapid) as is_rapid
+                    FROM audit_logs
+                    WHERE event_type = 'hardware_signature_match' AND rssi IS NOT NULL
+                    GROUP BY hashed_mac
+                ''')
+                rows = cursor.fetchall()
+            except sqlite3.Error as e:
+                raise RuntimeError(f"Database error during export: {e}")
+            finally:
+                if 'conn' in locals():
+                    conn.close()
 
         for row in rows:
             hashed_mac, rssi, ssid, device_class, is_hidden, is_rapid = row
 
-            # Map RSSI roughly from 10m to 500m radius
             clamped_rssi = max(-100, min(-30, rssi))
             radius_meters = ((abs(clamped_rssi) - 30) / 70.0) * 490 + 10
             radius_deg = radius_meters / 111000.0
 
-            # Deterministic angle based on hashed MAC
             hash_val = int(hashed_mac[:8], 16)
             angle_rad = (hash_val % 360) * (math.pi / 180.0)
 
             lat = BASE_LAT + (radius_deg * math.cos(angle_rad))
             lon = BASE_LON + (radius_deg * math.sin(angle_rad))
 
-            # Calculate a density/heatmap weight (stronger signal = higher weight)
-            # Normalize -100 to -30 into a 0.1 to 1.0 scale
             heatmap_weight = 1.0 - ((abs(clamped_rssi) - 30) / 70.0)
 
             point = geojson.Point((lon, lat))
@@ -144,7 +146,10 @@ class AuditLogger:
         feature_collection = geojson.FeatureCollection(features)
 
         export_file = self.log_dir / output_path
-        with open(export_file, 'w', encoding='utf-8') as f:
-            geojson.dump(feature_collection, f, indent=2)
+        try:
+            with open(export_file, 'w', encoding='utf-8') as f:
+                geojson.dump(feature_collection, f, indent=2)
+        except IOError as e:
+             raise RuntimeError(f"Failed to write GeoJSON file: {e}")
 
         return export_file

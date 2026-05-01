@@ -1,39 +1,59 @@
-CORE OPERATIONAL DIRECTIVE: AGENTIC INTEGRATION ARCHITECTURE
+# Aether Auditor
 
-Role: You are acting as my Lead Integration Architect. I am an AI-augmented hacker managing an X99/i7-7800X system with 64GB RAM across Arch Linux and WSL2. Your goal is to build a high-impact tool by scavenging and "gluing" together existing open-source excellence.
+A high-fidelity environmental RF scanning and tactical structural transparency tool. Designed for legacy IoT environments, rogue AP detection, and unadvertised infrastructure backdoor discovery.
 
-1. The Scavenger Mandate (Internet Required):
-Do NOT write complex core logic from scratch. Use your VM’s internet access to find:
+## Architecture Highlights
+1. **Transparency Auditor (`src/core/scanner.py`)**: A multi-threaded daemon leveraging `scapy` to silently ingest 802.11 management frames. Decodes RSSI, hashes OUI logic, and flags rapid beacon emissions or hidden SSIDs.
+2. **Tactical Hybridity**: Switch seamlessly from Passive Stealth mapping to Active Probe emissions.
+3. **Audit Logger (`src/utils/logger.py`)**: SQLite-backed logging module tracking structural discoveries. Handles dynamic MAC anonymization (SHA256) and autonomous retention sweeping.
+4. **Interactive Dashboard (`src/ui/dashboard.py`)**: A purely non-blocking tactical CLI interface engineered with `rich`. It features pagination, validation queuing, and dynamic search/filtering.
+5. **Geo-Intelligence Mapping (`src/ui/map_view.py`)**: A standalone CustomTkinter map translating the structural SQLite logs to a live GeoJSON radius overlay utilizing pseudo-coordinate derivations.
 
-The Micro: Specific lines of code or modular functions from Gists or StackOverflow.
+## Setup Requirements
 
-The Macro: Full GitHub repositories, CLI tools, or open-source software packages.
+Aether Auditor relies on standard Linux utilities and a monitor-mode capable wireless card.
 
-The Logic: Research the most efficient way to solve the task using pre-existing, vetted code.
+```bash
+# Ubuntu / Kali Linux Dependencies
+sudo apt update
+sudo apt install -y aircrack-ng hostapd iproute2
 
-2. The "Glue" Architecture:
-Your primary coding task is to write the "glue"—the Python or Bash scripts that unify these disparate patches of code into a single, seamless tool. Focus on:
+# Python Environment Setup via `uv`
+uv pip install -e .
+```
 
-API bridges, data piping, and CLI argument handling (argparse).
+## Quick Start
 
-High-concurrency performance (utilizing my 12 threads and 64GB RAM).
+### 1. Configure Hardware Signatures
+Ensure `config/signatures.yaml` contains your high-priority hardware targets.
+```yaml
+signatures:
+  - device_class: "Legacy_Surveillance_Node"
+    mac_oui: "00:1A:2B"
+    expected_ssid: "FAILOVER_NET_1"
+    signal_threshold_dbm: -80
+```
 
-Distro-agnostic logic (detecting Arch vs. Debian/WSL2).
+### 2. Launch the Auditor CLI
+Initialize your wireless adapter into monitor mode (e.g., `airmon-ng start wlan0`), then run:
+```bash
+aether-audit
+```
 
-3. Execution & Verification:
-Before submitting, use your Execution Agent to:
+**CLI Keyboard Controls:**
+- `h`: Open Interactive Help Menu
+- `s`: Cycle Sort Modes (RSSI -> Anomaly -> Class)
+- `n` / `p`: Paginate live environment map
+- `v`: Enter Validation Mode (prompts for device ID to trigger active beacon)
+- `d`: Open detailed Device Analytics panel
+- `f`: Filter/Search live map (prompts for query)
+- `c`: Clear Search Filter
+- `a`: Toggle Active Probe Mode (Warning: Breaks Stealth operation)
+- `e`: Export SQLite Database to GeoJSON map file.
+- `q`: Graceful Shutdown
 
-Verify that the repositories or code patches you've found actually clone/install correctly in a Linux VM.
-
-Ensure the setup.sh is idempotent (can be run multiple times safely).
-
-4. Safety & UI Standards:
-
-The Gate: Every system-modifying action MUST have a [Y/n] manual confirmation prompt.
-
-The Bypass: Include a -y or --force flag for non-interactive piped workflows.
-
-The Audit: Log all major tool actions to a local SQLite database for history/memory.
-
-Current Project Objective:
-[ INSERT WHAT YOU WANT TO BUILD HERE. BE SPECIFIC ABOUT THE GOAL, BUT LET JULES FIND THE TOOLS. ]
+### 3. Launch Geo-Mapping Dashboard
+Once you have collected data, visualize it structurally:
+```bash
+aether-map
+```

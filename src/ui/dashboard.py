@@ -2,7 +2,7 @@ import sys
 import time
 import queue
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Any, List
 
 from rich.console import Console
@@ -42,6 +42,7 @@ class DashboardUI:
         self.prompt_mode = None # "VALIDATE" or "DETAIL"
         self.prompt_buffer = ""
         self.selected_detail_mac = None
+        self.search_query = ""
 
         # Stats
         self.start_time = time.time()
@@ -62,6 +63,9 @@ class DashboardUI:
         self.running = True
         self.validation_thread = threading.Thread(target=self._validation_worker, daemon=True)
         self.validation_thread.start()
+
+        self.cleanup_thread = threading.Thread(target=self._memory_cleanup_worker, daemon=True)
+        self.cleanup_thread.start()
 
     def set_feedback(self, msg: str, duration: int = 3):
         self.feedback_message = msg
@@ -123,6 +127,24 @@ class DashboardUI:
             except queue.Empty:
                 continue
 
+
+    def _memory_cleanup_worker(self):
+        while self.running:
+            time.sleep(30)
+            now = datetime.now()
+            cutoff = now - timedelta(minutes=5)
+            with self.lock:
+                stale_macs = []
+                for mac, data in self.devices.items():
+                    try:
+                        last_seen_dt = datetime.strptime(data["last_seen"], "%H:%M:%S").replace(year=now.year, month=now.month, day=now.day)
+                        if last_seen_dt < cutoff:
+                            stale_macs.append(mac)
+                    except Exception:
+                        pass
+                for mac in stale_macs:
+                    del self.devices[mac]
+
     def handle_keypress(self, key: str):
         if self.current_view == "PROMPT":
             if key == '\n' or key == '\r':
@@ -131,7 +153,7 @@ class DashboardUI:
                 self.prompt_buffer = self.prompt_buffer[:-1]
             elif key == 'q' and not self.prompt_buffer:
                 self.current_view = "MAIN"
-            elif key.isdigit():
+            elif key.isdigit() or (self.prompt_mode == "SEARCH" and key.isprintable()):
                  self.prompt_buffer += key
             return
 
@@ -162,6 +184,13 @@ class DashboardUI:
                 self.set_feedback(f"Exported GEOJSON to: {export_path}")
             except Exception as e:
                  self.set_feedback(f"Export Failed: {e}", duration=5)
+        elif key == 'f':
+            self.current_view = "PROMPT"
+            self.prompt_mode = "SEARCH"
+            self.prompt_buffer = ""
+        elif key == 'c':
+            self.search_query = ""
+            self.set_feedback("Cleared search filter.")
         elif key == 'v':
             self.current_view = "PROMPT"
             self.prompt_mode = "VALIDATE"
@@ -177,6 +206,12 @@ class DashboardUI:
     def _execute_prompt(self):
         if not self.prompt_buffer:
             self.current_view = "MAIN"
+            return
+
+        if self.prompt_mode == "SEARCH":
+            self.search_query = self.prompt_buffer.lower()
+            self.current_view = "MAIN"
+            self.set_feedback(f"Filtering by: {self.search_query}")
             return
 
         try:
@@ -203,6 +238,10 @@ class DashboardUI:
 
     def _get_sorted_devices(self) -> List[Dict]:
         devs = list(self.devices.values())
+        if self.search_query:
+            q = self.search_query
+            devs = [d for d in devs if q in d['mac'].lower() or q in d['ssid'].lower() or q in d.get('device_class', '').lower()]
+
         mode = self.SORT_MODES[self.sort_idx]
         if mode == "rssi":
             # Sort missing rssi to bottom
@@ -273,6 +312,8 @@ class DashboardUI:
         t.add_row("n / p", "Next / Previous Page")
         t.add_row("v", "Queue Validation Beacon (Prompt for ID)")
         t.add_row("d", "View Device Details (Prompt for ID)")
+        t.add_row("f", "Filter/Search Map (Prompt)")
+        t.add_row("c", "Clear Filter")
         t.add_row("a", "Toggle Active/Passive Probe Mode")
         t.add_row("e", "Export database to GeoJSON map")
         t.add_row("q", "Quit Aether Auditor")
@@ -355,9 +396,15 @@ class DashboardUI:
             )
 
         grid_title = f"Live Map (Page {self.current_page + 1}/{max_pages + 1}) | Sort: {self.SORT_MODES[self.sort_idx]}"
+        if self.search_query:
+            grid_title += f" | Filter: '{self.search_query}'"
         if self.current_view == "PROMPT":
-            action = "Validate" if self.prompt_mode == "VALIDATE" else "View Details"
-            grid_title = f"[{action}] Enter ID: {self.prompt_buffer}_"
+            if self.prompt_mode == "SEARCH":
+                action = "Search"
+            else:
+                action = "Validate" if self.prompt_mode == "VALIDATE" else "View Details"
+            grid_title = f"[{action}] Enter: {self.prompt_buffer}_"
+
 
         return Panel(grid_table, title=grid_title), Panel(anom_table, title="Detected Signatures")
 
