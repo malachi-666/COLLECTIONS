@@ -8,10 +8,14 @@ dependencies = [
     "scapy",
     "pyyaml",
     "rich",
+    "customtkinter",
+    "tkintermapview",
+    "geojson"
 ]
 
 [project.scripts]
 aether-audit = "src.ui.dashboard:main"
+aether-map = "src.ui.map_view:main"
 
 [dependency-groups]
 dev = [

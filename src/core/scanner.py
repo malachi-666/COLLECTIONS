@@ -1,60 +1,77 @@
 import threading
+import time
 from typing import Optional, Any, Callable, Dict
 
-from scapy.all import sniff, Dot11, Dot11Elt, RadioTap
+from scapy.all import sniff, Dot11, Dot11Elt, RadioTap, Dot11ProbeReq, sendp
 
 from src.config import AppConfig
 from src.utils.logger import AuditLogger
 
 class TransparencyAuditor:
     """
-    Audits the local RF environment for structural transparency by detecting unencrypted signal leakage.
-    Cross-references intercepted metadata against defined hardware signatures.
+    Audits the local RF environment for structural transparency.
+    Supports Tactical Hybridity: Stealth (Passive) and Diagnostic (Active Probes).
     """
 
     def __init__(self, config: AppConfig, logger: AuditLogger, on_device_seen: Optional[Callable[[Dict[str, Any]], None]] = None) -> None:
-        """
-        Initializes the TransparencyAuditor.
-
-        Args:
-            config (AppConfig): The application configuration containing hardware signatures.
-            logger (AuditLogger): The thread-safe logger for recording matches.
-            on_device_seen (Callable): Callback fired when a device is seen.
-        """
         self.config = config
         self.logger = logger
         self.on_device_seen = on_device_seen
         self._stop_event = threading.Event()
         self._audit_thread: Optional[threading.Thread] = None
+        self._probe_thread: Optional[threading.Thread] = None
         self.interface: Optional[str] = None
 
+        self.active_mode = False # Toggle for Option C (Stealth by default)
+        self._beacon_timestamps: Dict[str, float] = {}
+
+    def toggle_active_mode(self, enabled: bool):
+        """Switches between passive stealth monitoring and active diagnostic probing."""
+        self.active_mode = enabled
+        if enabled and self.interface and not (self._probe_thread and self._probe_thread.is_alive()):
+            self._probe_thread = threading.Thread(target=self._active_probe_loop, daemon=True)
+            self._probe_thread.start()
+
+    def _active_probe_loop(self):
+        """Option B: Transmits active probe requests intermittently to elicit hidden nodes."""
+        while not self._stop_event.is_set() and self.active_mode:
+            try:
+                if self.interface:
+                    # Broadcast generic Probe Request
+                    probe = RadioTap() / Dot11(type=0, subtype=4, addr1="ff:ff:ff:ff:ff:ff", addr2="00:11:22:33:44:55", addr3="ff:ff:ff:ff:ff:ff") / Dot11ProbeReq() / Dot11Elt(ID="SSID", info="")
+                    sendp(probe, iface=self.interface, verbose=0)
+            except Exception:
+                pass
+            time.sleep(5) # Delay to minimize RF footprint even when active
+
     def _packet_handler(self, packet: Any) -> None:
-        """
-        Callback for scapy.sniff. Processes 802.11 management frames.
-        """
         if self._stop_event.is_set():
             return
 
-        # Check if the packet is an 802.11 management frame
         if not packet.haslayer(Dot11):
             return
 
-        # Type 0 is management frame. Subtype 8 is Beacon, 4 is Probe Request, 5 is Probe Response
-        if packet.type == 0 and packet.subtype in (8, 4, 5):
-            mac_address = packet.addr2  # Transmitter address
+        if packet.type == 0 and packet.subtype in (8, 4, 5): # Beacon, ProbeReq, ProbeResp
+            mac_address = packet.addr2
             if not mac_address:
                 return
 
             mac_address = mac_address.upper()
 
             ssid = None
+            is_hidden = False
             if packet.haslayer(Dot11Elt):
-                # ID 0 is the SSID parameter set
                 try:
                     p = packet[Dot11Elt]
                     while isinstance(p, Dot11Elt):
                         if p.ID == 0:
-                            ssid = p.info.decode('utf-8', errors='ignore')
+                            # Detect hidden SSID (null bytes or empty)
+                            raw_info = p.info
+                            if not raw_info or all(b == 0 for b in raw_info):
+                                is_hidden = True
+                                ssid = "<HIDDEN>"
+                            else:
+                                ssid = raw_info.decode('utf-8', errors='ignore')
                             break
                         p = p.payload
                 except Exception:
@@ -62,67 +79,62 @@ class TransparencyAuditor:
 
             rssi = None
             if packet.haslayer(RadioTap):
-                # Depending on the driver, dBm_AntSignal might be present
                 try:
-                    # Accessing the dbm_antsignal field dynamically if it exists
                     if hasattr(packet[RadioTap], 'dBm_AntSignal'):
                          rssi = packet[RadioTap].dBm_AntSignal
                 except Exception:
                     pass
 
-            self._analyze_signature(mac_address, ssid, rssi)
+            # Detect rapid beacon anomaly (e.g. interval < 0.05s)
+            is_rapid = False
+            current_time = time.time()
+            if packet.subtype == 8: # Only track beacon intervals
+                last_time = self._beacon_timestamps.get(mac_address)
+                if last_time and (current_time - last_time) < 0.05:
+                    is_rapid = True
+                self._beacon_timestamps[mac_address] = current_time
 
-    def _analyze_signature(self, mac_address: str, ssid: Optional[str], rssi: Optional[int]) -> None:
-        """
-        Cross-references intercepted metadata against defined hardware signatures.
-        Fires callback for UI updates.
-        """
+            self._analyze_signature(mac_address, ssid, rssi, is_hidden, is_rapid)
+
+    def _analyze_signature(self, mac_address: str, ssid: Optional[str], rssi: Optional[int], is_hidden: bool, is_rapid: bool) -> None:
         is_anomaly = False
         device_class = "Unknown"
-        threshold = None
 
         for sig in self.config.signatures:
-            # Check OUI prefix match
             if mac_address.startswith(sig.mac_oui.upper()):
-                # If expected_ssid is defined, it must match
-                if sig.expected_ssid and sig.expected_ssid != ssid:
+                if sig.expected_ssid and sig.expected_ssid != ssid and not is_hidden:
                     continue
 
-                # Check signal threshold if RSSI is available
                 if rssi is not None and rssi < sig.signal_threshold_dbm:
                     continue
 
                 is_anomaly = True
                 device_class = sig.device_class
-                threshold = sig.signal_threshold_dbm
 
-                # Log the confirmed anomaly
                 event_data = {
                     "event_type": "hardware_signature_match",
                     "device_class": device_class,
                     "intercepted_mac": mac_address,
                     "intercepted_ssid": ssid,
                     "intercepted_rssi": rssi,
-                    "matched_oui": sig.mac_oui,
-                    "threshold_dbm": threshold
+                    "is_hidden": is_hidden,
+                    "is_rapid": is_rapid
                 }
                 self.logger.log_event(event_data)
-                break # Matched highest priority first
+                break
 
-        # Fire UI callback for all devices seen to build the grid
         if self.on_device_seen:
             self.on_device_seen({
                 "mac": mac_address,
-                "ssid": ssid or "<hidden>",
+                "ssid": ssid or "<unknown>",
                 "rssi": rssi,
                 "is_anomaly": is_anomaly,
-                "device_class": device_class
+                "device_class": device_class,
+                "is_hidden": is_hidden,
+                "is_rapid": is_rapid
             })
 
     def _sniff_loop(self) -> None:
-        """
-        The continuous sniffing loop that runs in a daemon thread.
-        """
         def stop_filter(p: Any) -> bool:
             return self._stop_event.is_set()
 
@@ -132,9 +144,6 @@ class TransparencyAuditor:
             self.logger.log_event({"event_type": "auditor_error", "error": str(e)})
 
     def start_audit(self, interface: str) -> None:
-        """
-        Starts the auditing loop in a background daemon thread.
-        """
         if self._audit_thread and self._audit_thread.is_alive():
             raise RuntimeError("Audit is already running.")
 
@@ -144,12 +153,16 @@ class TransparencyAuditor:
         self._audit_thread = threading.Thread(target=self._sniff_loop, daemon=True)
         self._audit_thread.start()
 
+        if self.active_mode:
+             self._probe_thread = threading.Thread(target=self._active_probe_loop, daemon=True)
+             self._probe_thread.start()
+
     def stop_audit(self) -> None:
-        """
-        Stops the auditing loop.
-        """
         self._stop_event.set()
         if self._audit_thread:
             self._audit_thread.join(timeout=2.0)
             self._audit_thread = None
+        if self._probe_thread:
+            self._probe_thread.join(timeout=2.0)
+            self._probe_thread = None
         self.interface = None
