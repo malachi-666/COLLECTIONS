@@ -34,6 +34,7 @@ def setup_logger():
 
 logger = setup_logger()
 
+
 def log_event(event_type, level, data):
     entry = {
         "timestamp": datetime.datetime.now().isoformat(),
@@ -44,7 +45,17 @@ def log_event(event_type, level, data):
     logger.info(json.dumps(entry))
     return entry
 
-# --- Niche Tools ---
+# --- UTILS ---
+
+
+def luhn_check(pan):
+    """Luhn Check Digit Validation."""
+    if not pan.isdigit(): return False
+    digits = [int(d) for d in str(pan)]
+    checksum = sum(digits[-1::-2])
+    for d in digits[-2::-2]:
+        checksum += sum([int(x) for x in str(d*2)])
+    return checksum % 10 == 0
 
 def luhn_generate(pan_prefix):
     """Calculates missing digit of a PAN."""
@@ -61,7 +72,6 @@ def luhn_generate(pan_prefix):
     return str(pan_prefix) + str(check_digit)
 
 def hex_dump(data_bytes):
-    """Raw Hex/Binary Dumper for inspecting non-standard data."""
     if not data_bytes: return ""
     return " ".join([f"{b:02X}" for b in data_bytes])
 
@@ -111,11 +121,10 @@ def parse_ber_tlv(data):
         if i + length > len(data):
             break
 
-        # Read Value
         value = data[i:i+length]
         i += length
 
-        # If Constructed Data Object, parse recursively
+        # Constructed Data Object check
         if (tag & 0x20) == 0x20:
             parsed[tag_hex] = parse_ber_tlv(value)
         else:
@@ -126,34 +135,27 @@ def parse_ber_tlv(data):
 # --- Architecture ---
 
 class BaseModule:
-    """Modular Extension Template for all hardware tools."""
+    """Modular Extension Template."""
     def __init__(self, name, desc, author, help_text=""):
-        self.metadata = {
-            "name": name,
-            "description": desc,
-            "author": author
-        }
+        self.metadata = {"name": name, "description": desc, "author": author}
         self.help_text = help_text
 
     def validate(self):
-        """Pre-run hardware check."""
         return True, "Valid"
 
     def get_actions(self):
-        """Returns a list of tuples: (ActionName, RequiresInputFlag)"""
         return [("Run Default", False)]
 
     def run(self, action, user_input, q):
-        """Primary asynchronous execution logic."""
-        raise NotImplementedError("Modules must implement run().")
+        raise NotImplementedError()
 
 class CCIDModule(BaseModule):
     def __init__(self):
         super().__init__(
-            "OmniKey PC/SC Mastery",
-            "EMV Extraction, Memory Card Probing, Raw APDU.",
+            "OMNIKEY PC/SC Mastery",
+            "ISO-7816-4 selection flow, EMV Extraction.",
             "Chimeric",
-            "Advanced PC/SC suite. Supports EMV flows and OmniKey Synchronous APIs."
+            "Advanced PC/SC suite. Supports full EMV flows."
         )
 
     def validate(self):
@@ -163,7 +165,7 @@ class CCIDModule(BaseModule):
 
     def get_actions(self):
         return [
-            ("EMV Data Extraction", False),
+            ("EMV Data Extraction (PPSE -> GPO -> Read Rec)", False),
             ("Memory Card Probing (OmniKey Sync)", False),
             ("Raw APDU Terminal", True)
         ]
@@ -177,7 +179,7 @@ class CCIDModule(BaseModule):
             atr = conn.getATR()
             q.put(("result", {"ATR": toHexString(atr)}))
 
-            if action == "EMV Data Extraction":
+            if action == "EMV Data Extraction (PPSE -> GPO -> Read Rec)":
                 self._emv_extraction(conn, q)
             elif action == "Memory Card Probing (OmniKey Sync)":
                 self._memory_probing(conn, q)
@@ -193,30 +195,25 @@ class CCIDModule(BaseModule):
         # 1. Select PPSE
         apdu_ppse = [0x00, 0xA4, 0x04, 0x00, 0x0E, 0x32, 0x50, 0x41, 0x59, 0x2E, 0x53, 0x59, 0x53, 0x2E, 0x44, 0x44, 0x46, 0x30, 0x31, 0x00]
         data, sw1, sw2 = conn.transmit(apdu_ppse)
-        q.put(("log", {"level": "debug", "msg": f"PPSE Select: {hex(sw1)} {hex(sw2)}"}))
+        q.put(("log", {"level": "logic", "msg": f"PPSE Select: {hex(sw1)} {hex(sw2)}"}))
 
         if sw1 != 0x90:
-            q.put(("log", {"level": "warning", "msg": "Failed to select PPSE. Card may not be EMV."}))
+            q.put(("log", {"level": "alert", "msg": "Failed to select PPSE."}))
             return
 
         tlv = parse_ber_tlv(data)
         q.put(("result", {"PPSE_TLV": tlv}))
 
-        # 2. Extract AID (Assuming standard 4F tag inside 61 or A5 inside BF0C... brute forcing a common structure for simplicity)
         aid_hex = None
         try:
-            # Simplified path extraction for typical PPSE
             fci_prop = tlv.get("6F", {}).get("A5", {})
             bf0c = fci_prop.get("BF0C", {})
             app_template = bf0c.get("61", {})
             if isinstance(app_template, dict):
                 aid_hex = app_template.get("4F")
-            elif isinstance(app_template, list): # if multiple apps
-                pass
         except:
             pass
 
-        # Hard fallback to common AIDs if extraction fails
         common_aids = {
             "Visa": [0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10],
             "Mastercard": [0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10]
@@ -234,7 +231,7 @@ class CCIDModule(BaseModule):
                 q.put(("result", {"AID_TLV": tlv}))
 
         if not aid_selected:
-            q.put(("log", {"level": "warning", "msg": "AID extraction failed or not 9000. Trying fallbacks..."}))
+            q.put(("log", {"level": "logic", "msg": "Trying fallback AIDs..."}))
             for name, aid_bytes in common_aids.items():
                 apdu_aid = [0x00, 0xA4, 0x04, 0x00, len(aid_bytes)] + aid_bytes + [0x00]
                 data, sw1, sw2 = conn.transmit(apdu_aid)
@@ -244,7 +241,7 @@ class CCIDModule(BaseModule):
                     break
 
         if not aid_selected:
-            q.put(("log", {"level": "error", "msg": "Could not select any application AID."}))
+            q.put(("log", {"level": "alert", "msg": "Could not select any application AID."}))
             return
 
         # 3. GET PROCESSING OPTIONS
@@ -252,13 +249,13 @@ class CCIDModule(BaseModule):
         apdu_gpo = [0x80, 0xA8, 0x00, 0x00, 0x02, 0x83, 0x00, 0x00]
         data, sw1, sw2 = conn.transmit(apdu_gpo)
         if sw1 != 0x90:
-            q.put(("log", {"level": "error", "msg": f"GPO Failed: {hex(sw1)} {hex(sw2)}"}))
+            q.put(("log", {"level": "alert", "msg": f"GPO Failed: {hex(sw1)} {hex(sw2)}"}))
             return
 
         q.put(("result", {"GPO_Response": toHexString(data)}))
 
         # 4. READ RECORD Brute Force (SFI 1-3, Records 1-5)
-        q.put(("log", {"level": "info", "msg": "Brute forcing READ RECORD for Track 2 Equivalent Data (57) and PAN (5A)..."}))
+        q.put(("log", {"level": "info", "msg": "Brute forcing READ RECORD..."}))
         found_data = {}
         for sfi in range(1, 4):
             for rec in range(1, 6):
@@ -268,8 +265,6 @@ class CCIDModule(BaseModule):
                 if sw1 == 0x90:
                     parsed = parse_ber_tlv(data)
                     found_data[f"SFI_{sfi}_Rec_{rec}"] = parsed
-                    # Look for Track 2 (57) or PAN (5A)
-                    # Note: We must search recursively in 70 template
                     template = parsed.get("70", {})
                     if "5A" in template:
                         q.put(("log", {"level": "success", "msg": f"Found PAN (5A): {template['5A']}"}))
@@ -281,11 +276,10 @@ class CCIDModule(BaseModule):
 
     def _memory_probing(self, conn, q):
         q.put(("log", {"level": "info", "msg": "Probing Memory Cards via OmniKey Synchronous API..."}))
-        # OmniKey Synchronous APDU format: FF 20 00 00 02 <CardType> 00
         targets = {
             "SLE4442": [0xFF, 0x20, 0x00, 0x00, 0x02, 0x01, 0x00],
             "SLE4428": [0xFF, 0x20, 0x00, 0x00, 0x02, 0x02, 0x00],
-            "I2C (FM24C)": [0xFF, 0x20, 0x00, 0x00, 0x02, 0x06, 0x00] # General I2C fallback type
+            "I2C (FM24C)": [0xFF, 0x20, 0x00, 0x00, 0x02, 0x06, 0x00]
         }
         for name, apdu in targets.items():
             try:
@@ -293,9 +287,9 @@ class CCIDModule(BaseModule):
                 if sw1 == 0x90:
                     q.put(("log", {"level": "success", "msg": f"{name} Memory Card Detected! (sw1=90)"}))
                 else:
-                    q.put(("log", {"level": "debug", "msg": f"{name} probe returned {hex(sw1)}{hex(sw2)}"}))
+                    q.put(("log", {"level": "logic", "msg": f"{name} probe returned {hex(sw1)}{hex(sw2)}"}))
             except Exception as e:
-                q.put(("log", {"level": "error", "msg": f"{name} probe failed: {e}"}))
+                q.put(("log", {"level": "alert", "msg": f"{name} probe failed: {e}"}))
 
     def _raw_apdu(self, conn, user_input, q):
         user_input = user_input.replace(" ", "")
@@ -307,7 +301,7 @@ class CCIDModule(BaseModule):
             desc = ISO_7816_ERRORS.get(sw_code, "Unknown status code.")
             q.put(("result", {"APDU_Response": toHexString(data), "Status": f"{sw_code} ({desc})"}))
         except Exception as e:
-            q.put(("log", {"level": "error", "msg": f"Invalid APDU format or transmission error: {e}"}))
+            q.put(("log", {"level": "alert", "msg": f"Invalid APDU format or transmission error: {e}"}))
 
 
 class MSRModule(BaseModule):
@@ -316,7 +310,7 @@ class MSRModule(BaseModule):
             "MSR605X Controller",
             "Bit-Level Control for MSR605X hardware.",
             "Chimeric",
-            "MSR605X Serial Protocol Implementation. Supports Read, Write, Erase and Raw Listen modes."
+            "MSR605X Serial Protocol Implementation. Supports Read, Write, Erase and Interactive Listen modes."
         )
 
     def validate(self):
@@ -329,9 +323,8 @@ class MSRModule(BaseModule):
     def get_actions(self):
         return [
             ("Read All Tracks (ISO 7813)", False),
-            ("Raw Data Listener", False),
+            ("Interactive Swipe (Raw Listener)", False),
             ("Erase All Tracks", False),
-            ("Erase T2/T3 Only", False),
             ("Write Tracks (Interactive)", True)
         ]
 
@@ -344,8 +337,8 @@ class MSRModule(BaseModule):
                     self._set_led(ser, '1') # Amber
                     q.put(("log", {"level": "info", "msg": "Issuing READ ALL command (Waiting for swipe)..."}))
                     ser.write(b"\x1b\x72")
-                    data = ser.read_until(b"?\x1c") # Typical end sentinel block
-                    if not data: data = ser.read(200) # fallback
+                    data = ser.read_until(b"?\x1c")
+                    if not data: data = ser.read(200)
 
                     if data:
                         self._set_led(ser, '2') # Green
@@ -354,45 +347,34 @@ class MSRModule(BaseModule):
                             decoded = data.decode('ascii', errors='ignore')
                             self._parse_iso_7813(decoded, q)
                         except Exception as e:
-                            q.put(("log", {"level": "warning", "msg": f"Failed to ASCII decode: {e}"}))
+                            q.put(("log", {"level": "alert", "msg": f"Failed to ASCII decode: {e}"}))
                     else:
                         self._set_led(ser, '3') # Red
-                        q.put(("log", {"level": "warning", "msg": "Read timeout or empty buffer."}))
+                        q.put(("log", {"level": "alert", "msg": "Read timeout or empty buffer."}))
 
-                elif action == "Raw Data Listener":
+                elif action == "Interactive Swipe (Raw Listener)":
                     self._set_led(ser, '1') # Amber
-                    q.put(("log", {"level": "info", "msg": "Raw mode active. Swipe card now..."}))
-                    # Some MSRs use a different command for raw byte stream, or we just listen
-                    ser.write(b"\x1b\x72") # Try normal read, but don't ascii decode
+                    q.put(("log", {"level": "info", "msg": "Interactive mode active. Swipe card now..."}))
+                    ser.write(b"\x1b\x72")
                     data = ser.read(500)
                     if data:
                         self._set_led(ser, '2') # Green
+                        q.put(("log", {"level": "success", "msg": "Card swiped. Raw bitstream captured."}))
                         q.put(("result", {"Raw_Bitstream_Hex": hex_dump(data)}))
                     else:
                         self._set_led(ser, '3') # Red
-                        q.put(("log", {"level": "warning", "msg": "No raw data received."}))
+                        q.put(("log", {"level": "alert", "msg": "No raw data received within timeout."}))
 
                 elif action == "Erase All Tracks":
                     self._set_led(ser, '1')
                     q.put(("log", {"level": "info", "msg": "Issuing ERASE ALL (Swipe to confirm)..."}))
-                    # 0x07 = 00000111 (T1, T2, T3)
                     ser.write(b"\x1b\x63\x07")
-                    data = ser.read(10)
-                    self._set_led(ser, '2')
-                    q.put(("log", {"level": "success", "msg": f"Erase complete. Device returned: {hex_dump(data)}"}))
-
-                elif action == "Erase T2/T3 Only":
-                    self._set_led(ser, '1')
-                    q.put(("log", {"level": "info", "msg": "Issuing ERASE T2/T3 (Swipe to confirm)..."}))
-                    # 0x06 = 00000110 (T2, T3)
-                    ser.write(b"\x1b\x63\x06")
                     data = ser.read(10)
                     self._set_led(ser, '2')
                     q.put(("log", {"level": "success", "msg": f"Erase complete. Device returned: {hex_dump(data)}"}))
 
                 elif action == "Write Tracks (Interactive)":
                     self._set_led(ser, '1')
-                    # Expecting input format: "T1|T2|T3"
                     tracks = user_input.split('|')
                     t1 = tracks[0] if len(tracks) > 0 else ""
                     t2 = tracks[1] if len(tracks) > 1 else ""
@@ -405,11 +387,12 @@ class MSRModule(BaseModule):
                     self._set_led(ser, '2')
                     q.put(("log", {"level": "success", "msg": f"Write complete. Device returned: {hex_dump(data)}"}))
 
+        except serial.SerialException as e:
+            q.put(("log", {"level": "alert", "msg": f"Serial I/O Error: {str(e)}"}))
         except Exception as e:
-            q.put(("log", {"level": "error", "msg": f"Serial Error: {str(e)}"}))
+            q.put(("log", {"level": "alert", "msg": f"MSR Error: {str(e)}"}))
 
     def _set_led(self, ser, color_code):
-        """1: Amber, 2: Green, 3: Red"""
         try:
             ser.write(b"\x1b\x28" + color_code.encode())
         except:
@@ -424,21 +407,9 @@ class MSRModule(BaseModule):
         if t1_match:
             t1 = t1_match.group(1)[:-1]
             parsed['Track1'] = {"Raw": t1}
-            parts = t1.split('^')
-            if len(parts) >= 3:
-                parsed['Track1']['Format'] = parts[0][0]
-                parsed['Track1']['PAN'] = parts[0][1:]
-                parsed['Track1']['Name'] = parts[1]
-
         if t2_match:
             t2 = t2_match.group(1)[:-1]
             parsed['Track2'] = {"Raw": t2}
-            parts = t2.split('=')
-            if len(parts) == 2:
-                parsed['Track2']['PAN'] = parts[0]
-                parsed['Track2']['Expiration'] = parts[1][:4]
-                parsed['Track2']['ServiceCode'] = parts[1][4:7]
-
         if t3_match:
             parsed['Track3'] = {"Raw": t3_match.group(1)[:-1]}
 
@@ -465,18 +436,19 @@ class LuhnModule(BaseModule):
             q.put(("result", {"Input_Prefix": prefix, "Generated_PAN": result}))
             q.put(("log", {"level": "success", "msg": "Luhn generation complete."}))
         else:
-            q.put(("log", {"level": "error", "msg": "Invalid input. PAN prefix must be numeric."}))
+            q.put(("log", {"level": "alert", "msg": "Invalid input. PAN prefix must be numeric."}))
+
 
 # --- TUI ---
 
-ASCII_SKULL = """
-      .ok0KXXKK0ko.
+XD_SKULL = """
+     .ok0KXXKK0ko.
     .c0WMMMMMMMMMMW0c.
    .dWMMMMMMMMMMMMMMWd.
    oWMMMWX0kkkk0XWMMMWo
   .xMMMXc..    ..cXMMMx.
-  .xMMWd.  'XX'  .dWMMx.
-   oWMWo.  'XX'  .oWMWo
+  .xMMWd.  >  <  .dWMMx.
+   oWMWo.  ====  .oWMWo
    .dWMXl.      .lXMWd.
     .c0WMXxo::oxXMW0c.
       .ok0KXXKK0ko.
@@ -489,9 +461,8 @@ class TUI:
         self.stdscr.nodelay(True)
         self.h, self.w = self.stdscr.getmaxyx()
 
-        # Load Modules dynamically (Normally from a directory, but hardcoded list for single file)
         self.modules = [cls() for cls in BaseModule.__subclasses__()]
-        self.state = "MENU" # MENU, SUBMENU, INPUT, RUNNING
+        self.state = "MENU"
         self.menu_idx = 0
         self.sub_idx = 0
         self.input_text = ""
@@ -499,17 +470,36 @@ class TUI:
         self.q = queue.Queue()
         self.logs = []
 
-        # Setup colors
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_RED, -1)
-        curses.init_pair(2, curses.COLOR_CYAN, -1)
-        curses.init_pair(3, curses.COLOR_GREEN, -1)
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)
+        curses.init_pair(1, curses.COLOR_RED, -1)     # Alerts
+        curses.init_pair(2, curses.COLOR_CYAN, -1)    # Logic
+        curses.init_pair(3, curses.COLOR_GREEN, -1)   # Success
 
         self.log_pad = curses.newpad(5000, self.w)
         self.log_pad_pos = 0
         self.auto_scroll = True
+
+        # Hardware Status Threading
+        self.hw_status = {"OMNIKEY": "SCANNING", "MSR": "SCANNING"}
+        threading.Thread(target=self._status_poller, daemon=True).start()
+
+    def _status_poller(self):
+        while True:
+            # Poll CCID
+            try:
+                r = readers()
+                self.hw_status["OMNIKEY"] = "ONLINE" if r else "OFFLINE"
+            except:
+                self.hw_status["OMNIKEY"] = "ERROR"
+
+            # Poll Serial
+            try:
+                ports = serial.tools.list_ports.comports()
+                self.hw_status["MSR"] = "ONLINE" if ports else "OFFLINE"
+            except:
+                self.hw_status["MSR"] = "ERROR"
+            time.sleep(2)
 
     def get_border(self):
         return "+" + ("~v^" * (self.w // 3))[:self.w-2] + "+"
@@ -517,16 +507,15 @@ class TUI:
     def draw(self):
         self.stdscr.clear()
 
-        # Top Border
-        self.stdscr.addstr(0, 0, self.get_border(), curses.color_pair(2))
+        # Double-Border Layout
+        border = self.get_border()
+        self.stdscr.addstr(0, 0, border, curses.color_pair(2))
 
-        # Skull
-        for i, line in enumerate(ASCII_SKULL.strip().split('\n')):
+        for i, line in enumerate(XD_SKULL.strip().split('\n')):
             self.stdscr.addstr(i+1, 2, line, curses.color_pair(1))
 
         start_y = 13
 
-        # --- DRAW STATE: MENU ---
         if self.state in ["MENU", "SUBMENU", "INPUT"]:
             self.stdscr.addstr(start_y, 2, "MODULE SELECTION (j/k: Navigate, Enter: Select, q: Quit):", curses.color_pair(2) | curses.A_BOLD)
             for idx, mod in enumerate(self.modules):
@@ -534,86 +523,90 @@ class TUI:
                 attr = curses.A_REVERSE if idx == self.menu_idx and self.state == "MENU" else curses.A_NORMAL
                 self.stdscr.addstr(start_y + 2 + idx, 4, f"{prefix}{mod.metadata['name']} - {mod.metadata['description']}", attr | curses.color_pair(2))
 
-            # Module Help Text
             mod = self.modules[self.menu_idx]
-            self.stdscr.addstr(start_y + 2 + len(self.modules) + 1, 4, f"INFO: {mod.help_text}", curses.color_pair(3))
+            self.stdscr.addstr(start_y + 2 + len(self.modules) + 1, 4, f"INFO: {mod.help_text}", curses.color_pair(2))
 
-        # --- DRAW STATE: SUBMENU ---
         if self.state == "SUBMENU":
             mod = self.modules[self.menu_idx]
             actions = mod.get_actions()
             sub_start_y = start_y + 2 + len(self.modules) + 3
-            self.stdscr.addstr(sub_start_y, 2, f"ACTIONS FOR {mod.metadata['name'].upper()} (j/k: Navigate, Enter: Execute, ESC: Back):", curses.color_pair(1) | curses.A_BOLD)
+            self.stdscr.addstr(sub_start_y, 2, f"ACTIONS FOR {mod.metadata['name'].upper()} (j/k: Navigate, Enter: Execute, ESC: Back):", curses.color_pair(2) | curses.A_BOLD)
             for idx, act in enumerate(actions):
                 prefix = "> " if idx == self.sub_idx else "  "
                 attr = curses.A_REVERSE if idx == self.sub_idx else curses.A_NORMAL
                 req_in = "[Req Input]" if act[1] else ""
                 self.stdscr.addstr(sub_start_y + 2 + idx, 4, f"{prefix}{act[0]} {req_in}", attr | curses.color_pair(2))
 
-        # --- DRAW STATE: INPUT ---
         if self.state == "INPUT":
             mod = self.modules[self.menu_idx]
             act = mod.get_actions()[self.sub_idx]
             in_y = start_y + 2 + len(self.modules) + 8
-            self.stdscr.addstr(in_y, 2, f"INPUT REQUIRED FOR '{act[0]}':", curses.color_pair(4) | curses.A_BOLD)
-            self.stdscr.addstr(in_y + 1, 4, f"> {self.input_text}_", curses.color_pair(3))
+            self.stdscr.addstr(in_y, 2, f"INPUT REQUIRED FOR '{act[0]}':", curses.color_pair(2) | curses.A_BOLD)
+            self.stdscr.addstr(in_y + 1, 4, f"> {self.input_text}_", curses.color_pair(2))
+
+        # Bottom Status Bar
+        stat_y = self.h - 1
+        stat_str = f" CHIMERIC OS | OMNIKEY: {self.hw_status['OMNIKEY']} | MSR: {self.hw_status['MSR']} "
+        self.stdscr.addstr(stat_y, 0, stat_str.ljust(self.w), curses.color_pair(1) | curses.A_REVERSE)
+
+        # Log Pad Border
+        log_h = max(5, self.h // 2 - 2)
+        start_log_y = stat_y - log_h - 1
+        self.stdscr.addstr(start_log_y - 1, 0, border, curses.color_pair(2))
+        self.stdscr.addstr(start_log_y - 1, 2, "[ FORENSIC LOG / RESULTS (PgUp/PgDn to scroll) ]", curses.color_pair(2) | curses.A_REVERSE)
 
         self.stdscr.refresh()
 
-        # --- DRAW LOG PAD ---
-        log_h = max(5, self.h // 2 - 2)
-        start_log_y = self.h - log_h - 1
-
-        # Mid Border
-        self.stdscr.addstr(start_log_y - 1, 0, self.get_border(), curses.color_pair(2))
-        self.stdscr.addstr(start_log_y - 1, 2, "[ FORENSIC LOG / RESULTS (PgUp/PgDn to scroll) ]", curses.color_pair(1) | curses.A_REVERSE)
-
+        # Draw Log Pad
         self.log_pad.clear()
         for i, lg in enumerate(self.logs):
-            cp = curses.color_pair(3)
-            if "[ERROR]" in lg: cp = curses.color_pair(1)
-            elif "[WARNING]" in lg: cp = curses.color_pair(4)
-            elif "[RESULT]" in lg: cp = curses.color_pair(2) | curses.A_BOLD
+            cp = curses.color_pair(2) # Default Logic Cyan
+            if "[ALERT]" in lg or "[ERROR]" in lg: cp = curses.color_pair(1)
+            elif "[SUCCESS]" in lg or "[RESULT]" in lg: cp = curses.color_pair(3)
             self.log_pad.addstr(i, 0, lg[:self.w-1], cp)
 
         max_scroll = max(0, len(self.logs) - log_h)
         if self.auto_scroll:
             self.log_pad_pos = max_scroll
 
-        # Ensure bounds
         if self.log_pad_pos < 0: self.log_pad_pos = 0
         if self.log_pad_pos > max_scroll: self.log_pad_pos = max_scroll
 
         try:
-            self.log_pad.refresh(self.log_pad_pos, 0, start_log_y, 1, self.h-1, self.w-1)
+            self.log_pad.refresh(self.log_pad_pos, 0, start_log_y, 1, stat_y - 1, self.w-1)
         except curses.error:
-            pass # Ignore resize bounds temporarily
+            pass
 
     def process_queue(self):
         dirty = False
         while not self.q.empty():
             try:
                 msg_type, payload = self.q.get_nowait()
-                stamp = datetime.datetime.now().strftime('%H:%M:%S')
-                if msg_type == 'log':
-                    self.logs.append(f'[{stamp}] [{payload["level"].upper()}] {payload["msg"]}')
+                stamp = datetime.datetime.now().strftime("%H:%M:%S")
+                if msg_type == "log":
+                    entry_str = f"[{stamp}] [{payload['level'].upper()}] {payload['msg']}"
+                    self.logs.append(entry_str)
+                    log_event("hw_event", payload['level'], payload['msg'])
                     dirty = True
-                elif msg_type == 'result':
+                elif msg_type == "result":
                     res_str = json.dumps(payload, indent=2)
-                    for rline in res_str.split('\n'):
-                        for chunk in [rline[i:i+self.w-20] for i in range(0, max(1, len(rline)), self.w-20)]:
-                            self.logs.append(f'[{stamp}] [RESULT] {chunk}')
+                    for line in res_str.split('\n'):
+                        for chunk in [line[i:i+self.w-20] for i in range(0, max(1, len(line)), self.w-20)]:
+                            self.logs.append(f"[{stamp}] [RESULT] {chunk}")
+                    log_event("hw_result", "info", payload)
                     dirty = True
-                elif msg_type == 'done':
-                    self.state = 'SUBMENU'
+                elif msg_type == "done":
+                    self.state = "SUBMENU"
                     dirty = True
             except Exception:
                 pass
+
         if len(self.logs) > 4000:
             self.logs = self.logs[-4000:]
         return dirty
+
     def run(self):
-        self.logs.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [INFO] Chimeric OS Hardware Control Suite Online.")
+        self.logs.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [LOGIC] Chimeric OS Hardware Control Suite Online.")
         self.draw()
 
         while True:
@@ -646,7 +639,7 @@ class TUI:
                         self.menu_idx -= 1
                     elif key in [curses.KEY_DOWN, ord('j')] and self.menu_idx < len(self.modules) - 1:
                         self.menu_idx += 1
-                    elif key in [10, 13]: # Enter
+                    elif key in [10, 13]:
                         self.state = "SUBMENU"
                         self.sub_idx = 0
                     elif key == ord('q'):
@@ -660,11 +653,11 @@ class TUI:
                         self.sub_idx -= 1
                     elif key in [curses.KEY_DOWN, ord('j')] and self.sub_idx < len(actions) - 1:
                         self.sub_idx += 1
-                    elif key == 27: # ESC
+                    elif key == 27:
                         self.state = "MENU"
-                    elif key in [10, 13]: # Enter
+                    elif key in [10, 13]:
                         act = actions[self.sub_idx]
-                        if act[1]: # Requires Input
+                        if act[1]:
                             self.state = "INPUT"
                             self.input_text = ""
                             curses.curs_set(1)
@@ -673,10 +666,10 @@ class TUI:
 
                 # State: INPUT
                 elif self.state == "INPUT":
-                    if key == 27: # ESC
+                    if key == 27:
                         self.state = "SUBMENU"
                         curses.curs_set(0)
-                    elif key in [10, 13]: # Enter
+                    elif key in [10, 13]:
                         curses.curs_set(0)
                         mod = self.modules[self.menu_idx]
                         act = mod.get_actions()[self.sub_idx]
@@ -699,13 +692,13 @@ class TUI:
         self.draw()
         valid, msg = mod.validate()
         if valid:
-            self.q.put(("log", {"level": "info", "msg": f"Initiating {action_name}..."}))
+            self.q.put(("log", {"level": "logic", "msg": f"Initiating {action_name}..."}))
             def worker():
                 mod.run(action_name, user_input, self.q)
                 self.q.put(("done", None))
             threading.Thread(target=worker, daemon=True).start()
         else:
-            self.q.put(("log", {"level": "error", "msg": f"Validation failed: {msg}"}))
+            self.q.put(("log", {"level": "alert", "msg": f"Validation failed: {msg}"}))
             self.state = "SUBMENU"
 
 if __name__ == "__main__":
