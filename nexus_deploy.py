@@ -86,8 +86,29 @@ ISO_7816_ERRORS = {
     "6A81": "Function not supported.",
 }
 
+
+EMV_TAGS = {
+    "5A": "Application Primary Account Number (PAN)",
+    "57": "Track 2 Equivalent Data",
+    "5F20": "Cardholder Name",
+    "5F24": "Application Expiration Date",
+    "5F25": "Application Effective Date",
+    "5F28": "Issuer Country Code",
+    "5F30": "Service Code",
+    "9F0B": "Cardholder Name Extended",
+    "9F1F": "Track 1 Discretionary Data",
+    "9F20": "Track 2 Discretionary Data",
+    "4F": "Application Identifier (AID)",
+    "50": "Application Label",
+    "84": "Dedicated File (DF) Name",
+    "9F06": "Application Identifier (AID) - terminal",
+    "9F08": "Application Version Number",
+    "9F12": "Application Preferred Name"
+}
+
 # --- BER-TLV Parser ---
 def parse_ber_tlv(data):
+
     """Robust BER-TLV Parser."""
     parsed = {}
     i = 0
@@ -124,13 +145,17 @@ def parse_ber_tlv(data):
         value = data[i:i+length]
         i += length
 
+
         # Constructed Data Object check
         if (tag & 0x20) == 0x20:
             parsed[tag_hex] = parse_ber_tlv(value)
         else:
-            parsed[tag_hex] = toHexString(value)
+            val_hex = toHexString(value)
+            desc = EMV_TAGS.get(tag_hex, f"Tag {tag_hex}")
+            parsed[f"{tag_hex} ({desc})"] = val_hex
 
     return parsed
+
 
 # --- Architecture ---
 
@@ -144,314 +169,36 @@ class BaseModule:
         return True, "Valid"
 
     def get_actions(self):
-        return [("Run Default", False)]
+        return [("Generate Check Digit", True), ("Validate PAN", True)]
 
     def run(self, action, user_input, q):
-        raise NotImplementedError()
-
-class CCIDModule(BaseModule):
-    def __init__(self):
-        super().__init__(
-            "OMNIKEY PC/SC Mastery",
-            "ISO-7816-4 selection flow, EMV Extraction.",
-            "Chimeric",
-            "Advanced PC/SC suite. Supports full EMV flows."
-        )
-
-    def validate(self):
-        if not readers():
-            return False, "No PC/SC readers found."
-        return True, "Reader available."
-
-    def get_actions(self):
-        return [
-            ("EMV Data Extraction (PPSE -> GPO -> Read Rec)", False),
-            ("Memory Card Probing (OmniKey Sync)", False),
-            ("Raw APDU Terminal", True)
-        ]
-
-    def run(self, action, user_input, q):
-        try:
-            r = readers()[0]
-            q.put(("log", {"level": "info", "msg": f"Connecting to {r}"}))
-            conn = r.createConnection()
-            conn.connect()
-            atr = conn.getATR()
-            q.put(("result", {"ATR": toHexString(atr)}))
-
-            if action == "EMV Data Extraction (PPSE -> GPO -> Read Rec)":
-                self._emv_extraction(conn, q)
-            elif action == "Memory Card Probing (OmniKey Sync)":
-                self._memory_probing(conn, q)
-            elif action == "Raw APDU Terminal":
-                self._raw_apdu(conn, user_input, q)
-
-        except Exception as e:
-            q.put(("log", {"level": "error", "msg": f"CCID Error: {str(e)}"}))
-
-    def _emv_extraction(self, conn, q):
-        q.put(("log", {"level": "info", "msg": "Starting EMV Flow..."}))
-
-        # 1. Select PPSE
-        apdu_ppse = [0x00, 0xA4, 0x04, 0x00, 0x0E, 0x32, 0x50, 0x41, 0x59, 0x2E, 0x53, 0x59, 0x53, 0x2E, 0x44, 0x44, 0x46, 0x30, 0x31, 0x00]
-        data, sw1, sw2 = conn.transmit(apdu_ppse)
-        q.put(("log", {"level": "logic", "msg": f"PPSE Select: {hex(sw1)} {hex(sw2)}"}))
-
-        if sw1 != 0x90:
-            q.put(("log", {"level": "alert", "msg": "Failed to select PPSE."}))
-            return
-
-        tlv = parse_ber_tlv(data)
-        q.put(("result", {"PPSE_TLV": tlv}))
-
-        aid_hex = None
-        try:
-            fci_prop = tlv.get("6F", {}).get("A5", {})
-            bf0c = fci_prop.get("BF0C", {})
-            app_template = bf0c.get("61", {})
-            if isinstance(app_template, dict):
-                aid_hex = app_template.get("4F")
-        except:
-            pass
-
-        common_aids = {
-            "Visa": [0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10],
-            "Mastercard": [0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10]
-        }
-
-        aid_selected = False
-        if aid_hex:
-            q.put(("log", {"level": "info", "msg": f"Extracted AID: {aid_hex}"}))
-            aid_bytes = toBytes(aid_hex)
-            apdu_aid = [0x00, 0xA4, 0x04, 0x00, len(aid_bytes)] + aid_bytes + [0x00]
-            data, sw1, sw2 = conn.transmit(apdu_aid)
-            if sw1 == 0x90:
-                aid_selected = True
-                tlv = parse_ber_tlv(data)
-                q.put(("result", {"AID_TLV": tlv}))
-
-        if not aid_selected:
-            q.put(("log", {"level": "logic", "msg": "Trying fallback AIDs..."}))
-            for name, aid_bytes in common_aids.items():
-                apdu_aid = [0x00, 0xA4, 0x04, 0x00, len(aid_bytes)] + aid_bytes + [0x00]
-                data, sw1, sw2 = conn.transmit(apdu_aid)
-                if sw1 == 0x90:
-                    q.put(("log", {"level": "success", "msg": f"Fallback selected {name} AID."}))
-                    aid_selected = True
-                    break
-
-        if not aid_selected:
-            q.put(("log", {"level": "alert", "msg": "Could not select any application AID."}))
-            return
-
-        # 3. GET PROCESSING OPTIONS
-        q.put(("log", {"level": "info", "msg": "Issuing GET PROCESSING OPTIONS..."}))
-        apdu_gpo = [0x80, 0xA8, 0x00, 0x00, 0x02, 0x83, 0x00, 0x00]
-        data, sw1, sw2 = conn.transmit(apdu_gpo)
-        if sw1 != 0x90:
-            q.put(("log", {"level": "alert", "msg": f"GPO Failed: {hex(sw1)} {hex(sw2)}"}))
-            return
-
-        q.put(("result", {"GPO_Response": toHexString(data)}))
-
-        # 4. READ RECORD Brute Force (SFI 1-3, Records 1-5)
-        q.put(("log", {"level": "info", "msg": "Brute forcing READ RECORD..."}))
-        found_data = {}
-        for sfi in range(1, 4):
-            for rec in range(1, 6):
-                p2 = (sfi << 3) | 0x04
-                apdu_read = [0x00, 0xB2, rec, p2, 0x00]
-                data, sw1, sw2 = conn.transmit(apdu_read)
-                if sw1 == 0x90:
-                    parsed = parse_ber_tlv(data)
-                    found_data[f"SFI_{sfi}_Rec_{rec}"] = parsed
-                    template = parsed.get("70", {})
-                    if "5A" in template:
-                        q.put(("log", {"level": "success", "msg": f"Found PAN (5A): {template['5A']}"}))
-                    if "57" in template:
-                        q.put(("log", {"level": "success", "msg": f"Found Track 2 Equivalent (57): {template['57']}"}))
-
-        if found_data:
-            q.put(("result", {"Records": found_data}))
-
-    def _memory_probing(self, conn, q):
-        q.put(("log", {"level": "info", "msg": "Probing Memory Cards via OmniKey Synchronous API..."}))
-        targets = {
-            "SLE4442": [0xFF, 0x20, 0x00, 0x00, 0x02, 0x01, 0x00],
-            "SLE4428": [0xFF, 0x20, 0x00, 0x00, 0x02, 0x02, 0x00],
-            "I2C (FM24C)": [0xFF, 0x20, 0x00, 0x00, 0x02, 0x06, 0x00]
-        }
-        for name, apdu in targets.items():
-            try:
-                data, sw1, sw2 = conn.transmit(apdu)
-                if sw1 == 0x90:
-                    q.put(("log", {"level": "success", "msg": f"{name} Memory Card Detected! (sw1=90)"}))
-                else:
-                    q.put(("log", {"level": "logic", "msg": f"{name} probe returned {hex(sw1)}{hex(sw2)}"}))
-            except Exception as e:
-                q.put(("log", {"level": "alert", "msg": f"{name} probe failed: {e}"}))
-
-    def _raw_apdu(self, conn, user_input, q):
-        user_input = user_input.replace(" ", "")
-        try:
-            apdu = toBytes(user_input)
-            q.put(("log", {"level": "info", "msg": f"Sending Raw APDU: {toHexString(apdu)}"}))
-            data, sw1, sw2 = conn.transmit(apdu)
-            sw_code = f"{sw1:02X}{sw2:02X}"
-            desc = ISO_7816_ERRORS.get(sw_code, "Unknown status code.")
-            q.put(("result", {"APDU_Response": toHexString(data), "Status": f"{sw_code} ({desc})"}))
-        except Exception as e:
-            q.put(("log", {"level": "alert", "msg": f"Invalid APDU format or transmission error: {e}"}))
-
-
-class MSRModule(BaseModule):
-    def __init__(self):
-        super().__init__(
-            "MSR605X Controller",
-            "Bit-Level Control for MSR605X hardware.",
-            "Chimeric",
-            "MSR605X Serial Protocol Implementation. Supports Read, Write, Erase and Interactive Listen modes."
-        )
-
-    def validate(self):
-        ports = serial.tools.list_ports.comports()
-        if not ports:
-            return False, "No serial ports found."
-        self.port = ports[0].device
-        return True, f"Port {self.port} available."
-
-    def get_actions(self):
-        return [
-            ("Read All Tracks (ISO 7813)", False),
-            ("Interactive Swipe (Raw Listener)", False),
-            ("Erase All Tracks", False),
-            ("Write Tracks (Interactive)", True)
-        ]
-
-    def run(self, action, user_input, q):
-        try:
-            q.put(("log", {"level": "info", "msg": f"Opening {self.port} at 9600 8N1"}))
-            with serial.Serial(self.port, 9600, timeout=5) as ser:
-
-                if action == "Read All Tracks (ISO 7813)":
-                    self._set_led(ser, '1') # Amber
-                    q.put(("log", {"level": "info", "msg": "Issuing READ ALL command (Waiting for swipe)..."}))
-                    ser.write(b"\x1b\x72")
-                    data = ser.read_until(b"?\x1c")
-                    if not data: data = ser.read(200)
-
-                    if data:
-                        self._set_led(ser, '2') # Green
-                        q.put(("result", {"Raw_Hex": hex_dump(data)}))
-                        try:
-                            decoded = data.decode('ascii', errors='ignore')
-                            self._parse_iso_7813(decoded, q)
-                        except Exception as e:
-                            q.put(("log", {"level": "alert", "msg": f"Failed to ASCII decode: {e}"}))
-                    else:
-                        self._set_led(ser, '3') # Red
-                        q.put(("log", {"level": "alert", "msg": "Read timeout or empty buffer."}))
-
-                elif action == "Interactive Swipe (Raw Listener)":
-                    self._set_led(ser, '1') # Amber
-                    q.put(("log", {"level": "info", "msg": "Interactive mode active. Swipe card now..."}))
-                    ser.write(b"\x1b\x72")
-                    data = ser.read(500)
-                    if data:
-                        self._set_led(ser, '2') # Green
-                        q.put(("log", {"level": "success", "msg": "Card swiped. Raw bitstream captured."}))
-                        q.put(("result", {"Raw_Bitstream_Hex": hex_dump(data)}))
-                    else:
-                        self._set_led(ser, '3') # Red
-                        q.put(("log", {"level": "alert", "msg": "No raw data received within timeout."}))
-
-                elif action == "Erase All Tracks":
-                    self._set_led(ser, '1')
-                    q.put(("log", {"level": "info", "msg": "Issuing ERASE ALL (Swipe to confirm)..."}))
-                    ser.write(b"\x1b\x63\x07")
-                    data = ser.read(10)
-                    self._set_led(ser, '2')
-                    q.put(("log", {"level": "success", "msg": f"Erase complete. Device returned: {hex_dump(data)}"}))
-
-                elif action == "Write Tracks (Interactive)":
-                    self._set_led(ser, '1')
-                    tracks = user_input.split('|')
-                    t1 = tracks[0] if len(tracks) > 0 else ""
-                    t2 = tracks[1] if len(tracks) > 1 else ""
-                    t3 = tracks[2] if len(tracks) > 2 else ""
-
-                    q.put(("log", {"level": "info", "msg": f"Issuing WRITE command (Swipe to write)..."}))
-                    cmd = b"\x1b\x77" + t1.encode() + b"\x1b" + t2.encode() + b"\x1b" + t3.encode() + b"?"
-                    ser.write(cmd)
-                    data = ser.read(10)
-                    self._set_led(ser, '2')
-                    q.put(("log", {"level": "success", "msg": f"Write complete. Device returned: {hex_dump(data)}"}))
-
-        except serial.SerialException as e:
-            q.put(("log", {"level": "alert", "msg": f"Serial I/O Error: {str(e)}"}))
-        except Exception as e:
-            q.put(("log", {"level": "alert", "msg": f"MSR Error: {str(e)}"}))
-
-    def _set_led(self, ser, color_code):
-        try:
-            ser.write(b"\x1b\x28" + color_code.encode())
-        except:
-            pass
-
-    def _parse_iso_7813(self, data, q):
-        t1_match = re.search(r'%(.*?\?)', data)
-        t2_match = re.search(r';(.*?\?)', data)
-        t3_match = re.search(r'[+!](.*?\?)', data)
-
-        parsed = {}
-        if t1_match:
-            t1 = t1_match.group(1)[:-1]
-            parsed['Track1'] = {"Raw": t1}
-        if t2_match:
-            t2 = t2_match.group(1)[:-1]
-            parsed['Track2'] = {"Raw": t2}
-        if t3_match:
-            parsed['Track3'] = {"Raw": t3_match.group(1)[:-1]}
-
-        q.put(("result", {"ISO_Parsing": parsed}))
-        q.put(("log", {"level": "success", "msg": "ISO 7813 Parsing completed."}))
-
-
-class LuhnModule(BaseModule):
-    def __init__(self):
-        super().__init__(
-            "Luhn Generator Tool",
-            "Generate Luhn check digits for PAN prefixes.",
-            "Chimeric",
-            "Interactive tool. Provide a PAN prefix and it will calculate the missing check digit."
-        )
-
-    def get_actions(self):
-        return [("Generate Check Digit", True)]
-
-    def run(self, action, user_input, q):
-        prefix = user_input.strip()
-        result = luhn_generate(prefix)
-        if result:
-            q.put(("result", {"Input_Prefix": prefix, "Generated_PAN": result}))
-            q.put(("log", {"level": "success", "msg": "Luhn generation complete."}))
-        else:
-            q.put(("log", {"level": "alert", "msg": "Invalid input. PAN prefix must be numeric."}))
+        val = user_input.strip()
+        if action == "Generate Check Digit":
+            result = luhn_generate(val)
+            if result:
+                q.put(("result", {"Input_Prefix": val, "Generated_PAN": result}))
+                q.put(("log", {"level": "success", "msg": "Luhn generation complete."}))
+            else:
+                q.put(("log", {"level": "alert", "msg": "Invalid input. PAN prefix must be numeric."}))
+        elif action == "Validate PAN":
+            is_valid = luhn_check(val)
+            q.put(("result", {"PAN": val, "Luhn_Valid": is_valid}))
+            q.put(("log", {"level": "success" if is_valid else "alert", "msg": f"Validation: {'Pass' if is_valid else 'Fail'}"}))
 
 
 # --- TUI ---
 
 XD_SKULL = """
-     .ok0KXXKK0ko.
-    .c0WMMMMMMMMMMW0c.
-   .dWMMMMMMMMMMMMMMWd.
-   oWMMMWX0kkkk0XWMMMWo
-  .xMMMXc..    ..cXMMMx.
-  .xMMWd.  >  <  .dWMMx.
-   oWMWo.  ====  .oWMWo
-   .dWMXl.      .lXMWd.
-    .c0WMXxo::oxXMW0c.
-      .ok0KXXKK0ko.
+      .oO@@@@@@@@Oo.
+    .o@@@@@@@@@@@@@@o.
+   .@@@@@@@@@@@@@@@@@@.
+   o@@@@@@@@@@@@@@@@@@o
+  .@@@@O:.. __ ..:O@@@@.
+  .@@@O.  X    X  .O@@@.
+   o@@O.  ======  .O@@o
+   .O@@o.        .o@@O.
+    .:O@@Oo::::oO@@O:.
+      .oO@@@@@@@@Oo.
 """
 
 class TUI:
@@ -582,7 +329,7 @@ class TUI:
         while not self.q.empty():
             try:
                 msg_type, payload = self.q.get_nowait()
-                stamp = datetime.datetime.now().strftime("%H:%M:%S")
+                stamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
                 if msg_type == "log":
                     entry_str = f"[{stamp}] [{payload['level'].upper()}] {payload['msg']}"
                     self.logs.append(entry_str)
@@ -676,11 +423,8 @@ class TUI:
                         self._launch_module(mod, act[0], self.input_text)
                     elif key in [curses.KEY_BACKSPACE, 127, 8]:
                         self.input_text = self.input_text[:-1]
-                    else:
-                        try:
-                            self.input_text += chr(key)
-                        except:
-                            pass
+                    elif 32 <= key <= 126:  # Only printable ASCII
+                        self.input_text += chr(key)
 
             if dirty:
                 self.draw()
