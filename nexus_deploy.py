@@ -208,7 +208,7 @@ class TUI:
         self.stdscr.nodelay(True)
         self.h, self.w = self.stdscr.getmaxyx()
 
-        self.modules = [cls() for cls in BaseModule.__subclasses__()]
+        self.modules = [CCIDModule(), MSRModule(), LuhnModule()]
         self.state = "MENU"
         self.menu_idx = 0
         self.sub_idx = 0
