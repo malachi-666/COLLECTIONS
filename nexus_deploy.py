@@ -10,228 +10,223 @@ import curses
 import serial
 import serial.tools.list_ports
 from smartcard.System import readers
-from smartcard.util import toHexString
-from smartcard.Exceptions import NoCardException, CardConnectionException, CardConnectionObserver
+from smartcard.util import toHexString, toBytes
 import json
 import logging
 import datetime
 import threading
 import queue
 import time
-import os
+import sys
+import re
 
-# --- LOGGING SETUP ---
-LOG_FILE = "hardware_audit.json"
+# --- Niche Tools ---
 
-def setup_logger():
-    logger = logging.getLogger("ChimericAudit")
-    logger.setLevel(logging.DEBUG)
-    # File handler for JSON
-    fh = logging.FileHandler(LOG_FILE)
-    fh.setLevel(logging.DEBUG)
-    logger.addHandler(fh)
-    return logger
+def luhn_generate(pan_prefix):
+    """Luhn Check Digit Generator: Calculates missing digit of a PAN."""
+    if not pan_prefix.isdigit(): return None
+    digits = [int(d) for d in str(pan_prefix)]
+    # Multiply odd-positioned digits from the right by 2
+    checksum = 0
+    reverse_digits = digits[::-1]
+    for i, d in enumerate(reverse_digits):
+        if i % 2 == 0:
+            checksum += sum([int(x) for x in str(d * 2)])
+        else:
+            checksum += d
+    check_digit = (10 - (checksum % 10)) % 10
+    return str(pan_prefix) + str(check_digit)
 
-logger = setup_logger()
+def hex_dump(data_bytes):
+    """Raw Hex/Binary Dumper for inspecting non-standard data."""
+    if not data_bytes: return ""
+    return " ".join([f"{b:02X}" for b in data_bytes])
 
-def log_event(event_type, level, data):
-    entry = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "type": event_type,
-        "level": level,
-        "data": data
-    }
-    logger.info(json.dumps(entry))
-    return entry
-
-# --- UTILS ---
-def luhn_checksum(card_number):
-    def digits_of(n):
-        return [int(d) for d in str(n)]
-    digits = digits_of(card_number)
-    odd_digits = digits[-1::-2]
-    even_digits = digits[-2::-2]
-    checksum = sum(odd_digits)
-    for d in even_digits:
-        checksum += sum(digits_of(d*2))
-    return checksum % 10
-
-def validate_pan(pan):
-    if not pan.isdigit():
-        return False, "PAN contains non-digits"
-    is_valid = luhn_checksum(pan) == 0
-    return is_valid, "Valid Luhn" if is_valid else "Invalid Luhn checksum"
-
-# --- HARDWARE MODULES ---
-COMMON_AIDS = {
-    "PPSE": [0x32, 0x50, 0x41, 0x59, 0x2E, 0x53, 0x59, 0x53, 0x2E, 0x44, 0x44, 0x46, 0x30, 0x31],
-    "Visa": [0xA0, 0x00, 0x00, 0x00, 0x03, 0x10, 0x10],
-    "Mastercard": [0xA0, 0x00, 0x00, 0x00, 0x04, 0x10, 0x10],
-    "Amex": [0xA0, 0x00, 0x00, 0x00, 0x25, 0x01],
-    "Discover": [0xA0, 0x00, 0x00, 0x01, 0x52, 0x30, 0x10]
+ISO_7816_ERRORS = {
+    "9000": "Normal processing.",
+    "6A82": "File not found.",
+    "6E00": "Class not supported.",
+    "6D00": "Instruction code not supported or invalid.",
+    "6700": "Wrong length.",
+    "6982": "Security status not satisfied.",
+    "6985": "Conditions of use not satisfied.",
+    "6A81": "Function not supported.",
 }
 
-def auto_discover_serial():
-    ports = serial.tools.list_ports.comports()
-    # Prioritize USB serial adapters
-    usb_ports = [p.device for p in ports if 'USB' in p.description or 'USB' in p.device]
-    if usb_ports:
-        return usb_ports[0]
-    elif ports:
-        return ports[0].device
-    return None
+# --- Architecture ---
 
-def ccid_audit(q):
-    q.put(("log", {"level": "info", "msg": "Starting CCID Auto-Discovery..."}))
-    try:
-        r = readers()
-        if not r:
-            msg = "No smart card readers found. Check hardware connection."
-            log_event("ccid", "error", {"error": msg})
-            q.put(("log", {"level": "error", "msg": msg}))
-            q.put(("result", {"status": "error", "module": "CCID", "message": msg}))
-            return
-
-        reader = r[0]
-        q.put(("log", {"level": "info", "msg": f"Found reader: {reader}"}))
-        connection = reader.createConnection()
-        connection.connect()
-
-        atr = connection.getATR()
-        atr_hex = toHexString(atr)
-        q.put(("log", {"level": "info", "msg": f"ATR: {atr_hex}"}))
-
-        results = {"status": "success", "module": "CCID", "reader": str(reader), "atr": atr_hex, "fuzz_results": {}}
-
-        # Fuzzing mode
-        q.put(("log", {"level": "info", "msg": "Initiating AID fuzzing..."}))
-        for aid_name, aid_bytes in COMMON_AIDS.items():
-            apdu = [0x00, 0xA4, 0x04, 0x00, len(aid_bytes)] + aid_bytes + [0x00]
-            try:
-                data, sw1, sw2 = connection.transmit(apdu)
-                status_hex = f"{hex(sw1)} {hex(sw2)}"
-                found = (sw1 == 0x90 and sw2 == 0x00)
-                results["fuzz_results"][aid_name] = {"found": found, "sw": status_hex}
-                if found:
-                    q.put(("log", {"level": "success", "msg": f"Match found for AID: {aid_name}"}))
-                else:
-                    q.put(("log", {"level": "debug", "msg": f"No match for AID: {aid_name} ({status_hex})"}))
-            except Exception as e:
-                q.put(("log", {"level": "error", "msg": f"Error probing {aid_name}: {e}"}))
-                results["fuzz_results"][aid_name] = {"error": str(e)}
-
-        log_event("ccid", "info", results)
-        q.put(("result", results))
-
-    except NoCardException:
-        msg = "No card inserted in reader."
-        log_event("ccid", "warning", {"error": msg})
-        q.put(("log", {"level": "warning", "msg": msg}))
-        q.put(("result", {"status": "warning", "module": "CCID", "message": msg}))
-    except CardConnectionException as e:
-        msg = f"Card connection error (protocol mismatch or exclusive lock): {e}"
-        log_event("ccid", "error", {"error": msg})
-        q.put(("log", {"level": "error", "msg": msg}))
-        q.put(("result", {"status": "error", "module": "CCID", "message": msg}))
-    except Exception as e:
-        msg = f"CCID Exception: {e}"
-        log_event("ccid", "error", {"error": msg})
-        q.put(("log", {"level": "error", "msg": msg}))
-        q.put(("result", {"status": "error", "module": "CCID", "message": msg}))
-
-def magstripe_audit(q):
-    q.put(("log", {"level": "info", "msg": "Starting Serial Auto-Discovery..."}))
-    port = auto_discover_serial()
-
-    if not port:
-        msg = "No serial ports discovered. Check USB connection."
-        log_event("magstripe", "error", {"error": msg})
-        q.put(("log", {"level": "error", "msg": msg}))
-        q.put(("result", {"status": "error", "module": "Magstripe", "message": msg}))
-        return
-
-    q.put(("log", {"level": "info", "msg": f"Connecting to serial port: {port}"}))
-    try:
-        ser = serial.Serial(port, 9600, timeout=2)
-        q.put(("log", {"level": "info", "msg": "Awaiting Track 2 data... (Timeout: 2s)"}))
-
-        # Try to read line
-        # Depending on the hardware it might need a command or just push data
-        ser.write(b"READ\n")
-        data = ser.readline().decode('utf-8', errors='ignore').strip()
-        ser.close()
-
-        if not data:
-            msg = "No data received from serial device on read timeout."
-            log_event("magstripe", "warning", {"error": msg})
-            q.put(("log", {"level": "warning", "msg": msg}))
-            q.put(("result", {"status": "warning", "module": "Magstripe", "message": msg}))
-            return
-
-        q.put(("log", {"level": "info", "msg": f"Raw data received: {data}"}))
-
-        # Enhanced Track 2 Parsing
-        results = {
-            "status": "success",
-            "module": "Magstripe",
-            "port": port,
-            "original_data": data,
-            "parsed": False
+class BaseModule:
+    """Modular Extension Template for all hardware tools."""
+    def __init__(self, name, desc, author):
+        self.metadata = {
+            "name": name,
+            "description": desc,
+            "author": author
         }
 
-        if '=' in data:
-            parts = data.split('=')
-            pan = parts[0]
-            if pan.startswith(';'):
-                pan = pan[1:]
+    def validate(self):
+        """Pre-run hardware check."""
+        return True, "Valid"
 
-            rest = parts[1]
-            if len(rest) >= 7:
-                results["parsed"] = True
-                exp_year = rest[0:2]
-                exp_month = rest[2:4]
-                service_code = rest[4:7]
-                discretionary = rest[7:].split('?')[0] # Remove end sentinel
+    def run(self, q):
+        """Primary asynchronous execution logic."""
+        raise NotImplementedError("Modules must implement run().")
 
-                valid_luhn, luhn_msg = validate_pan(pan)
+class CCIDModule(BaseModule):
+    def __init__(self):
+        super().__init__("OmniKey PC/SC Mastery", "Raw APDU, Memory Card Probing, EMV Extraction.", "Chimeric")
 
-                results["parsed_data"] = {
-                    "pan": pan,
-                    "pan_length": len(pan),
-                    "luhn_valid": valid_luhn,
-                    "expiration": f"20{exp_year}-{exp_month}",
-                    "service_code": service_code,
-                    "discretionary_data": discretionary
-                }
+    def validate(self):
+        if not readers():
+            return False, "No PC/SC readers found."
+        return True, "Reader available."
 
-                # Service Code modification for testing
-                new_service_code = '101'
-                modified_data = f";{pan}={exp_year}{exp_month}{new_service_code}{discretionary}?"
-                results["modified_data"] = modified_data
+    def run(self, q):
+        try:
+            r = readers()[0]
+            q.put(("log", {"level": "info", "msg": f"Connecting to {r}"}))
+            conn = r.createConnection()
+            conn.connect()
+            atr = conn.getATR()
+            q.put(("result", {"ATR": toHexString(atr)}))
 
-                q.put(("log", {"level": "success", "msg": f"Track 2 successfully parsed. Luhn: {'Valid' if valid_luhn else 'Invalid'}"}))
-                if not valid_luhn:
-                    q.put(("log", {"level": "warning", "msg": f"Luhn validation failed: {luhn_msg}"}))
+            # --- EMV Data Extraction ---
+            q.put(("log", {"level": "info", "msg": "Attempting EMV Extraction..."}))
+            # Select PPSE
+            apdu_ppse = [0x00, 0xA4, 0x04, 0x00, 0x0E, 0x32, 0x50, 0x41, 0x59, 0x2E, 0x53, 0x59, 0x53, 0x2E, 0x44, 0x44, 0x46, 0x30, 0x31, 0x00]
+            data, sw1, sw2 = conn.transmit(apdu_ppse)
+            q.put(("log", {"level": "debug", "msg": f"PPSE Select: {hex(sw1)} {hex(sw2)}"}))
 
-        if not results.get("parsed"):
-            q.put(("log", {"level": "warning", "msg": "Data received but failed standard Track 2 parsing constraints."}))
+            if sw1 == 0x90:
+                # Basic EMV extraction logic (simplified for demonstration)
+                # In a real scenario, we'd parse the FCI template to find the AID, then select it.
+                q.put(("log", {"level": "success", "msg": "PPSE Selected. (Full EMV parsing requires specific AID selection)"}))
 
-        log_event("magstripe", "info", results)
-        q.put(("result", results))
+            # --- Memory Card Probing (OmniKey Synchronous API) ---
+            q.put(("log", {"level": "info", "msg": "Probing for SLE4442/4428 Memory Cards..."}))
+            # OmniKey specific APDU for synchronous card connection: FF 20 00 00 02 <CardType> 00
+            # SLE4442 = 0x01
+            apdu_sync = [0xFF, 0x20, 0x00, 0x00, 0x02, 0x01, 0x00]
+            try:
+                s_data, s_sw1, s_sw2 = conn.transmit(apdu_sync)
+                if s_sw1 == 0x90:
+                    q.put(("log", {"level": "success", "msg": "SLE4442 Memory Card Detected."}))
+                else:
+                    q.put(("log", {"level": "warning", "msg": "No SLE4442 detected or command rejected."}))
+            except Exception:
+                pass
 
-    except serial.SerialException as e:
-        msg = f"Serial Port Error (Permission denied or device disconnected): {e}"
-        log_event("magstripe", "error", {"error": msg})
-        q.put(("log", {"level": "error", "msg": msg}))
-        q.put(("result", {"status": "error", "module": "Magstripe", "message": msg}))
-    except Exception as e:
-        msg = f"Magstripe Exception: {e}"
-        log_event("magstripe", "error", {"error": msg})
-        q.put(("log", {"level": "error", "msg": msg}))
-        q.put(("result", {"status": "error", "module": "Magstripe", "message": msg}))
+            # --- Raw APDU Terminal (Simulated automated ping) ---
+            q.put(("log", {"level": "info", "msg": "Sending ping APDU (00 84 00 00 08 - Get Challenge)..."}))
+            apdu_ping = [0x00, 0x84, 0x00, 0x00, 0x08]
+            data, sw1, sw2 = conn.transmit(apdu_ping)
+            sw_code = f"{sw1:02X}{sw2:02X}"
+            desc = ISO_7816_ERRORS.get(sw_code, "Unknown status code.")
+            q.put(("result", {"APDU_Response": toHexString(data), "Status": f"{sw_code} ({desc})"}))
+
+        except Exception as e:
+            q.put(("log", {"level": "error", "msg": f"CCID Error: {str(e)}"}))
 
 
-# --- TUI IMPLEMENTATION ---
+class MSRModule(BaseModule):
+    def __init__(self):
+        super().__init__("MSR605X Controller", "Read/Write/Erase & ISO 7813 Track Parsing.", "Chimeric")
+
+    def validate(self):
+        ports = serial.tools.list_ports.comports()
+        if not ports:
+            return False, "No serial ports found."
+        self.port = ports[0].device
+        return True, f"Port {self.port} available."
+
+    def run(self, q):
+        try:
+            q.put(("log", {"level": "info", "msg": f"Opening {self.port} at 9600 8N1"}))
+            with serial.Serial(self.port, 9600, timeout=2) as ser:
+
+                # --- Set LED Colors (\x1b\x28) ---
+                q.put(("log", {"level": "info", "msg": "Setting MSR LED to Green..."}))
+                # Typical MSR605X LED command (e.g., ESC ( <color> ). Green = '2'
+                ser.write(b"\x1b\x28\x32")
+
+                # --- Read All Tracks (\x1b\x72) ---
+                q.put(("log", {"level": "info", "msg": "Issuing READ ALL command..."}))
+                ser.write(b"\x1b\x72")
+                data = ser.read(200)
+
+                if data:
+                    q.put(("result", {"Raw_Hex": hex_dump(data)}))
+                    try:
+                        decoded = data.decode('ascii', errors='ignore')
+                        self._parse_iso_7813(decoded, q)
+                    except Exception as e:
+                        q.put(("log", {"level": "warning", "msg": f"Failed to ASCII decode: {e}"}))
+                else:
+                    q.put(("log", {"level": "warning", "msg": "Read timeout or empty buffer."}))
+
+                # Note: Write (\x1b\x77) and Erase (\x1b\x63) commands are implemented
+                # as methods below but not actively fired in the default diagnostic run
+                # to prevent accidental data destruction.
+
+        except Exception as e:
+            q.put(("log", {"level": "error", "msg": f"Serial Error: {str(e)}"}))
+
+    def _parse_iso_7813(self, data, q):
+        """Parses Tracks 1, 2, and 3 according to ISO/IEC 7813."""
+        # T1 starts with %, T2 with ;, T3 with + or !
+        t1_match = re.search(r'%(.*?\?)', data)
+        t2_match = re.search(r';(.*?\?)', data)
+        t3_match = re.search(r'[+!](.*?\?)', data)
+
+        parsed = {}
+        if t1_match:
+            t1 = t1_match.group(1)[:-1] # Remove sentinel
+            parsed['Track1'] = {"Raw": t1}
+            # Format B: %B[PAN]^[Name]^[ExpYear][ExpMonth][ServiceCode][Discretionary]?
+            parts = t1.split('^')
+            if len(parts) >= 3:
+                parsed['Track1']['Format'] = parts[0][0]
+                parsed['Track1']['PAN'] = parts[0][1:]
+                parsed['Track1']['Name'] = parts[1]
+
+        if t2_match:
+            t2 = t2_match.group(1)[:-1]
+            parsed['Track2'] = {"Raw": t2}
+            parts = t2.split('=')
+            if len(parts) == 2:
+                parsed['Track2']['PAN'] = parts[0]
+                parsed['Track2']['Expiration'] = parts[1][:4]
+                parsed['Track2']['ServiceCode'] = parts[1][4:7]
+
+        if t3_match:
+            parsed['Track3'] = {"Raw": t3_match.group(1)[:-1]}
+
+        q.put(("result", {"ISO_Parsing": parsed}))
+        q.put(("log", {"level": "success", "msg": "ISO 7813 Parsing completed."}))
+
+    def execute_write(self, ser, t1, t2, t3):
+        """Write All Tracks (\x1b\x77)"""
+        # Format: ESC w <T1> ESC <T2> ESC <T3> ?
+        cmd = b"\x1b\x77" + t1.encode() + b"\x1b" + t2.encode() + b"\x1b" + t3.encode() + b"?"
+        ser.write(cmd)
+
+    def execute_erase(self, ser):
+        """Erase All Tracks (\x1b\x63)"""
+        # Erase specific tracks or all depending on mask
+        ser.write(b"\x1b\x63\x07") # 07 = all three tracks
+
+class LuhnModule(BaseModule):
+    def __init__(self):
+        super().__init__("Luhn Generator Tool", "Generate Luhn check digits for PAN prefixes.", "Chimeric")
+
+    def run(self, q):
+        # Simulated input for demonstration
+        prefix = "400000000000000"
+        result = luhn_generate(prefix)
+        q.put(("result", {"Input": prefix, "Generated PAN": result}))
+        q.put(("log", {"level": "success", "msg": "Luhn generation complete."}))
+
+# --- TUI ---
 
 ASCII_SKULL = """
       .ok0KXXKK0ko.
@@ -249,247 +244,120 @@ ASCII_SKULL = """
 class TUI:
     def __init__(self, stdscr):
         self.stdscr = stdscr
+        curses.curs_set(0)
+        self.stdscr.nodelay(True)
         self.h, self.w = self.stdscr.getmaxyx()
 
-        # Colors
+        # Dynamic module loading list
+        self.modules = [CCIDModule(), MSRModule(), LuhnModule()]
+        self.current_row = 0
+        self.q = queue.Queue()
+        self.logs = []
+
+        # Setup colors
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_RED, -1)     # Danger/Title
-        curses.init_pair(2, curses.COLOR_CYAN, -1)    # UI borders/Selections
-        curses.init_pair(3, curses.COLOR_WHITE, -1)   # Normal text
-        curses.init_pair(4, curses.COLOR_GREEN, -1)   # Success
-        curses.init_pair(5, curses.COLOR_YELLOW, -1)  # Warning
+        curses.init_pair(1, curses.COLOR_RED, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_GREEN, -1)
 
-        self.menu_items = ['1. CCID Discovery & Fuzzing', '2. Magstripe Parsing & Validation', '3. Verification Audit', '4. Exit']
-        self.current_row = 0
+        # Pad for asynchronous scrolling logs
+        self.log_pad = curses.newpad(2000, self.w)
+        self.log_pad_pos = 0
 
-        self.log_messages = []
-        self.max_log_lines = 10
-
-        self.current_result = None
-        self.is_running = False
-
-        self.q = queue.Queue()
-
-    def draw_skull(self, start_y, start_x):
-        lines = ASCII_SKULL.strip("\n").split("\n")
-        for i, line in enumerate(lines):
-            try:
-                self.stdscr.addstr(start_y + i, start_x, line, curses.color_pair(1) | curses.A_BOLD)
-            except curses.error:
-                pass
-        return len(lines)
-
-    def draw_layout(self):
+    def draw(self):
         self.stdscr.clear()
-        try:
-            self.h, self.w = self.stdscr.getmaxyx()
 
-            # Title
-            title = "CHIMERIC OS - HARDWARE DIAGNOSTIC UTILITY"
-            self.stdscr.addstr(1, max(0, self.w//2 - len(title)//2), title, curses.color_pair(1) | curses.A_BOLD)
+        # High-density ASCII oscilloscope borders
+        top_border = "+" + ("~v^" * (self.w // 3))[:self.w-2] + "+"
+        self.stdscr.addstr(0, 0, top_border, curses.color_pair(2))
 
-            # Header separator
-            self.stdscr.addstr(2, 0, "-" * self.w, curses.color_pair(2))
+        for i, line in enumerate(ASCII_SKULL.strip().split('\n')):
+            self.stdscr.addstr(i+1, 2, line, curses.color_pair(1))
 
-            # Split screen vertically if wide enough, else horizontal stack
-            left_pane_w = min(40, self.w - 2)
-
-            # Menu
-            menu_start_y = 4
-            self.stdscr.addstr(menu_start_y, 2, "MODULE SELECTION:", curses.color_pair(2) | curses.A_BOLD)
-            for idx, item in enumerate(self.menu_items):
-                y = menu_start_y + 2 + idx
-                if idx == self.current_row:
-                    self.stdscr.addstr(y, 4, item, curses.color_pair(2) | curses.A_REVERSE)
-                else:
-                    self.stdscr.addstr(y, 4, item, curses.color_pair(3))
-
-            # ASCII Art (bottom left)
-            skull_y = self.h - 15
-            if skull_y > menu_start_y + 2 + len(self.menu_items):
-                self.draw_skull(skull_y, 2)
-
-            # Vertical separator
-            if self.w > 60:
-                for y in range(3, self.h - 3):
-                    self.stdscr.addstr(y, left_pane_w + 2, "|", curses.color_pair(2))
-
-            # Data/Results Panel
-            res_start_x = left_pane_w + 4 if self.w > 60 else 2
-            res_start_y = 4
-            self.stdscr.addstr(res_start_y, res_start_x, "AUDIT RESULTS:", curses.color_pair(2) | curses.A_BOLD)
-
-            y = res_start_y + 2
-            if self.current_result:
-                for k, v in self.current_result.items():
-                    if y >= self.h - max(12, self.max_log_lines + 4): # leave room for logs
-                        break
-
-                    if isinstance(v, dict):
-                        self.stdscr.addstr(y, res_start_x, f"{k.upper()}:", curses.color_pair(3) | curses.A_BOLD)
-                        y += 1
-                        for sub_k, sub_v in v.items():
-                            if y >= self.h - max(12, self.max_log_lines + 4): break
-                            val_str = str(sub_v)
-                            # Truncate long strings
-                            max_len = self.w - res_start_x - len(sub_k) - 6
-                            if len(val_str) > max_len and max_len > 0:
-                                val_str = val_str[:max_len] + "..."
-
-                            self.stdscr.addstr(y, res_start_x + 2, f"{sub_k}: ", curses.color_pair(2))
-                            self.stdscr.addstr(val_str, curses.color_pair(3))
-                            y += 1
-                    else:
-                        val_str = str(v)
-                        max_len = self.w - res_start_x - len(k) - 4
-                        if len(val_str) > max_len and max_len > 0:
-                            val_str = val_str[:max_len] + "..."
-                        self.stdscr.addstr(y, res_start_x, f"{k}: ", curses.color_pair(2))
-                        self.stdscr.addstr(val_str, curses.color_pair(3))
-                        y += 1
-            else:
-                self.stdscr.addstr(y, res_start_x, "Awaiting module execution...", curses.color_pair(3) | curses.A_DIM)
-
-            # Logs Panel
-            log_start_y = self.h - self.max_log_lines - 3
-            self.stdscr.addstr(log_start_y, 0, "-" * self.w, curses.color_pair(2))
-            self.stdscr.addstr(log_start_y+1, 2, "REAL-TIME LOGS:", curses.color_pair(2) | curses.A_BOLD)
-
-            log_y = log_start_y + 2
-            for log in self.log_messages[-self.max_log_lines:]:
-                if log_y >= self.h - 1: break
-
-                lvl = log['level'].lower()
-                cp = curses.color_pair(3)
-                if lvl == 'error': cp = curses.color_pair(1)
-                elif lvl == 'warning': cp = curses.color_pair(5)
-                elif lvl == 'success': cp = curses.color_pair(4)
-                elif lvl == 'info': cp = curses.color_pair(2)
-
-                prefix = f"[{lvl.upper()}] "
-                msg = prefix + log['msg']
-                if len(msg) > self.w - 4:
-                    msg = msg[:self.w - 7] + "..."
-
-                self.stdscr.addstr(log_y, 2, prefix, cp | curses.A_BOLD)
-                self.stdscr.addstr(log['msg'][:self.w - 4 - len(prefix)], cp)
-                log_y += 1
-
-            # Status Bar
-            self.stdscr.addstr(self.h - 1, 0, " " * self.w, curses.color_pair(2) | curses.A_REVERSE)
-            status_text = " [UP/DOWN] Navigate | [ENTER] Execute | [Ctrl+C] Force Quit "
-            if self.is_running:
-                status_text = " EXECUTING... PLEASE WAIT | " + status_text
-            self.stdscr.addstr(self.h - 1, 0, status_text[:self.w], curses.color_pair(2) | curses.A_REVERSE)
-
-        except curses.error:
-            pass # Handle window too small gracefully
+        # Menu with dynamic modules
+        start_y = 13
+        self.stdscr.addstr(start_y, 2, "MODULE SELECTION (j/k to navigate, Enter to run, q to quit):", curses.color_pair(2) | curses.A_BOLD)
+        for idx, mod in enumerate(self.modules):
+            prefix = "[*] " if idx == self.current_row else "[ ] "
+            attr = curses.A_REVERSE if idx == self.current_row else curses.A_NORMAL
+            self.stdscr.addstr(start_y + 2 + idx, 4, f"{prefix}{mod.metadata['name']} - {mod.metadata['description']}", attr | curses.color_pair(2))
 
         self.stdscr.refresh()
+
+        # Draw Async Log Pad
+        log_h = max(5, self.h // 2)
+        start_log_y = self.h - log_h
+        mid_border = "+" + ("-" * (self.w-2)) + "+"
+        self.stdscr.addstr(start_log_y - 1, 0, mid_border, curses.color_pair(2))
+
+        # Calculate scroll position
+        max_scroll = max(0, len(self.logs) - log_h + 1)
+        self.log_pad_pos = max_scroll
+
+        self.log_pad.clear()
+        for i, lg in enumerate(self.logs):
+            self.log_pad.addstr(i, 0, lg[:self.w-1], curses.color_pair(3))
+        self.log_pad.refresh(self.log_pad_pos, 0, start_log_y, 1, self.h-1, self.w-1)
 
     def process_queue(self):
         dirty = False
         while not self.q.empty():
-            dirty = True
             try:
                 msg_type, payload = self.q.get_nowait()
+                stamp = datetime.datetime.now().strftime("%H:%M:%S")
                 if msg_type == "log":
-                    self.log_messages.append(payload)
+                    self.logs.append(f"[{stamp}] [{payload['level'].upper()}] {payload['msg']}")
+                    dirty = True
                 elif msg_type == "result":
-                    self.current_result = payload
-                    self.is_running = False
-            except queue.Empty:
-                break
+                    res_str = json.dumps(payload)
+                    # Word wrap long results
+                    for chunk in [res_str[i:i+self.w-20] for i in range(0, len(res_str), self.w-20)]:
+                        self.logs.append(f"[{stamp}] [RESULT] {chunk}")
+                    dirty = True
+            except Exception:
+                pass
         return dirty
 
     def run(self):
-        curses.curs_set(0)
-        self.stdscr.nodelay(True) # Non-blocking input
-
-        self.log_messages.append({"level": "info", "msg": "TUI Initialized. Hardware modules ready."})
-        self.draw_layout()
+        self.logs.append(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] [INFO] Chimeric OS Hardware Control initialized.")
+        self.draw()
 
         while True:
-            # Handle resizing and queue
+            dirty = self.process_queue()
             try:
                 key = self.stdscr.getch()
             except curses.error:
                 key = -1
 
-            dirty = self.process_queue()
-
             if key != -1:
                 dirty = True
-                if key == curses.KEY_RESIZE:
+                # Vim j/k integration alongside arrow keys
+                if key in [curses.KEY_UP, ord('k')] and self.current_row > 0:
+                    self.current_row -= 1
+                elif key in [curses.KEY_DOWN, ord('j')] and self.current_row < len(self.modules) - 1:
+                    self.current_row += 1
+                elif key in [10, 13]: # Enter
+                    mod = self.modules[self.current_row]
+                    valid, msg = mod.validate()
+                    if valid:
+                        self.q.put(("log", {"level": "info", "msg": f"Initiating {mod.metadata['name']}..."}))
+                        threading.Thread(target=mod.run, args=(self.q,), daemon=True).start()
+                    else:
+                        self.q.put(("log", {"level": "error", "msg": f"Validation failed: {msg}"}))
+                elif key == ord('q'):
+                    break
+                elif key == curses.KEY_RESIZE:
                     self.h, self.w = self.stdscr.getmaxyx()
+                    self.log_pad = curses.newpad(2000, self.w)
                     self.stdscr.clear()
-                elif not self.is_running:
-                    if key == curses.KEY_UP and self.current_row > 0:
-                        self.current_row -= 1
-                    elif key == curses.KEY_DOWN and self.current_row < len(self.menu_items) - 1:
-                        self.current_row += 1
-                    elif key == curses.KEY_ENTER or key in [10, 13]:
-                        if self.current_row == 0:
-                            self.is_running = True
-                            self.current_result = None
-                            self.log_messages.append({"level": "info", "msg": "-"*20})
-                            threading.Thread(target=ccid_audit, args=(self.q,), daemon=True).start()
-                        elif self.current_row == 1:
-                            self.is_running = True
-                            self.current_result = None
-                            self.log_messages.append({"level": "info", "msg": "-"*20})
-                            threading.Thread(target=magstripe_audit, args=(self.q,), daemon=True).start()
-                        elif self.current_row == 2:
-                            self.is_running = True
-                            self.current_result = {"status": "verification_started"}
-                            self.log_messages.append({"level": "info", "msg": "-"*20})
-                            self.log_messages.append({"level": "info", "msg": "Running Verification Audit..."})
-
-                            def verification_thread():
-                                local_q = queue.Queue()
-                                ccid_audit(local_q)
-                                magstripe_audit(local_q)
-
-                                results = {"CCID_Status": "Failed", "Magstripe_Status": "Failed"}
-
-                                while not local_q.empty():
-                                    msg_type, payload = local_q.get()
-                                    if msg_type == "log":
-                                        self.q.put(("log", payload))
-                                    elif msg_type == "result":
-                                        if payload.get("module") == "CCID":
-                                            results["CCID_Status"] = payload.get("status")
-                                            if payload.get("status") == "success":
-                                                results["CCID_ATR"] = payload.get("atr")
-                                        elif payload.get("module") == "Magstripe":
-                                            results["Magstripe_Status"] = payload.get("status")
-                                            if payload.get("status") == "success":
-                                                results["Magstripe_PAN"] = payload.get("parsed_data", {}).get("pan", "Unknown")
-
-                                if results["CCID_Status"] == "success" and results["Magstripe_Status"] == "success":
-                                    self.q.put(("log", {"level": "success", "msg": "Verification Audit completed successfully."}))
-                                else:
-                                    self.q.put(("log", {"level": "warning", "msg": "Verification Audit completed with hardware failures."}))
-
-                                self.q.put(("result", results))
-
-                            threading.Thread(target=verification_thread, daemon=True).start()
-
-                        elif self.current_row == 3:
-                            break
 
             if dirty:
-                self.draw_layout()
+                self.draw()
+            time.sleep(0.05)
 
-            time.sleep(0.05) # Prevent 100% CPU usage
-
-def main(stdscr):
-    app = TUI(stdscr)
-    app.run()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
-        curses.wrapper(main)
+        curses.wrapper(lambda stdscr: TUI(stdscr).run())
     except KeyboardInterrupt:
-        print("\nExiting Chimeric OS Hardware Diagnostic Utility.")
+        print("\n[!] Exiting hardware utility.")
