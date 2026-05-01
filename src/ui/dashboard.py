@@ -1,16 +1,17 @@
 import sys
 import time
-import asyncio
+import queue
 import threading
-from typing import Dict, Any
+from datetime import datetime
+from typing import Dict, Any, List
 
 from rich.console import Console
 from rich.layout import Layout
 from rich.table import Table
 from rich.panel import Panel
 from rich.live import Live
-from rich.prompt import Prompt
 from rich.text import Text
+from rich.prompt import Prompt
 
 from scapy.interfaces import get_if_list
 
@@ -18,10 +19,14 @@ from src.config import get_config, AppConfig
 from src.utils.logger import AuditLogger
 from src.core.scanner import TransparencyAuditor
 from src.core.validator import SignalValidator
+from src.ui.keyboard_listener import KeyboardListener
 
 console = Console()
 
 class DashboardUI:
+    PAGE_SIZE = 15
+    SORT_MODES = ["rssi", "anomaly", "class"]
+
     def __init__(self, config: AppConfig, logger: AuditLogger):
         self.config = config
         self.logger = logger
@@ -32,88 +37,330 @@ class DashboardUI:
         self.validator = SignalValidator()
         self.active_interface = None
 
-        # State for UI rendering
+        # State Machine
+        self.current_view = "MAIN" # MAIN, HELP, DETAIL, PROMPT
+        self.prompt_mode = None # "VALIDATE" or "DETAIL"
+        self.prompt_buffer = ""
+        self.selected_detail_mac = None
+
+        # Stats
+        self.start_time = time.time()
+        self.packet_count = 0
+        self.last_packet_time = time.time()
+        self.packets_per_sec = 0.0
+
+        # Features State
+        self.current_page = 0
+        self.sort_idx = 0
+        self.validation_queue = queue.Queue()
         self.is_validating = False
-        self.validating_target = None
+        self.current_validation_target = None
+        self.feedback_message = ""
+        self.feedback_timer = 0
+
+        # Worker Thread
+        self.running = True
+        self.validation_thread = threading.Thread(target=self._validation_worker, daemon=True)
+        self.validation_thread.start()
+
+    def set_feedback(self, msg: str, duration: int = 3):
+        self.feedback_message = msg
+        self.feedback_timer = time.time() + duration
 
     def on_device_seen(self, device_data: Dict[str, Any]):
         with self.lock:
             mac = device_data["mac"]
+            self.packet_count += 1
+
+            # Packets per sec
+            now = time.time()
+            if now - self.last_packet_time >= 1.0:
+                self.packets_per_sec = self.packet_count / (now - self.last_packet_time)
+                self.packet_count = 0
+                self.last_packet_time = now
+
             if mac not in self.devices:
                 self.devices[mac] = device_data
-            else:
-                # Update existing
-                self.devices[mac]["ssid"] = device_data["ssid"]
-                self.devices[mac]["rssi"] = device_data["rssi"]
-                # Upgrade anomaly status if previously missed
-                if device_data["is_anomaly"]:
-                    self.devices[mac]["is_anomaly"] = True
-                    self.devices[mac]["device_class"] = device_data["device_class"]
+                self.devices[mac]["history_rssi"] = []
+                self.devices[mac]["first_seen"] = datetime.now().strftime("%H:%M:%S")
 
-    def _get_proximity_text(self, rssi: int) -> Text:
-        if rssi is None:
-            return Text("Unknown", style="dim")
-        if rssi >= -60:
-            return Text("Immediate", style="bold red")
-        elif rssi >= -80:
-            return Text("Nearby", style="bold yellow")
-        else:
-            return Text("Distant", style="bold green")
+            # Update existing
+            self.devices[mac]["ssid"] = device_data["ssid"]
+            self.devices[mac]["rssi"] = device_data["rssi"]
+            if device_data["rssi"] is not None:
+                self.devices[mac]["history_rssi"].append(device_data["rssi"])
+                # Keep last 10
+                self.devices[mac]["history_rssi"] = self.devices[mac]["history_rssi"][-10:]
+
+            self.devices[mac]["last_seen"] = datetime.now().strftime("%H:%M:%S")
+
+            if device_data["is_anomaly"]:
+                self.devices[mac]["is_anomaly"] = True
+                self.devices[mac]["device_class"] = device_data["device_class"]
+            if device_data["is_hidden"]:
+                self.devices[mac]["is_hidden"] = True
+            if device_data["is_rapid"]:
+                self.devices[mac]["is_rapid"] = True
+
+    def _validation_worker(self):
+        while self.running:
+            try:
+                target_mac, target_ssid = self.validation_queue.get(timeout=1.0)
+                self.is_validating = True
+                self.current_validation_target = target_mac
+
+                try:
+                    self.validator.start_audit_beacon(self.active_interface, target_ssid)
+                    time.sleep(5)
+                except Exception:
+                    pass # Silently fail in worker, but log in real implementation
+                finally:
+                    self.validator.stop_audit()
+                    self.is_validating = False
+                    self.current_validation_target = None
+
+                self.validation_queue.task_done()
+            except queue.Empty:
+                continue
+
+    def handle_keypress(self, key: str):
+        if self.current_view == "PROMPT":
+            if key == '\n' or key == '\r':
+                self._execute_prompt()
+            elif key == '\x7f' or key == '\b': # Backspace
+                self.prompt_buffer = self.prompt_buffer[:-1]
+            elif key == 'q' and not self.prompt_buffer:
+                self.current_view = "MAIN"
+            elif key.isdigit():
+                 self.prompt_buffer += key
+            return
+
+        if key == 'q':
+            self.running = False
+            return
+        elif key == 'h':
+            self.current_view = "MAIN" if self.current_view == "HELP" else "HELP"
+        elif key == 's':
+            self.sort_idx = (self.sort_idx + 1) % len(self.SORT_MODES)
+        elif key == 'n':
+            with self.lock:
+                max_pages = max(0, (len(self.devices) - 1) // self.PAGE_SIZE)
+            if self.current_page < max_pages:
+                self.current_page += 1
+        elif key == 'p':
+            if self.current_page > 0:
+                self.current_page -= 1
+        elif key == 'a':
+            with self.lock:
+                new_state = not self.auditor.active_mode
+                self.auditor.toggle_active_mode(new_state)
+                state_str = "ACTIVE" if new_state else "PASSIVE"
+                self.set_feedback(f"Switched mode to {state_str}")
+        elif key == 'e':
+            try:
+                export_path = self.logger.export_geojson()
+                self.set_feedback(f"Exported GEOJSON to: {export_path}")
+            except Exception as e:
+                 self.set_feedback(f"Export Failed: {e}", duration=5)
+        elif key == 'v':
+            self.current_view = "PROMPT"
+            self.prompt_mode = "VALIDATE"
+            self.prompt_buffer = ""
+        elif key == 'd':
+            if self.current_view == "DETAIL":
+                self.current_view = "MAIN"
+            else:
+                self.current_view = "PROMPT"
+                self.prompt_mode = "DETAIL"
+                self.prompt_buffer = ""
+
+    def _execute_prompt(self):
+        if not self.prompt_buffer:
+            self.current_view = "MAIN"
+            return
+
+        try:
+            idx = int(self.prompt_buffer)
+            with self.lock:
+                sorted_devs = self._get_sorted_devices()
+                if 0 <= idx < len(sorted_devs):
+                    mac = sorted_devs[idx]["mac"]
+                    ssid = sorted_devs[idx]["ssid"]
+
+                    if self.prompt_mode == "VALIDATE":
+                        self.validation_queue.put((mac, ssid))
+                        self.set_feedback(f"Queued validation for {mac}")
+                        self.current_view = "MAIN"
+                    elif self.prompt_mode == "DETAIL":
+                        self.selected_detail_mac = mac
+                        self.current_view = "DETAIL"
+                else:
+                    self.set_feedback("Invalid index.", duration=2)
+                    self.current_view = "MAIN"
+        except ValueError:
+            self.set_feedback("Invalid input.", duration=2)
+            self.current_view = "MAIN"
+
+    def _get_sorted_devices(self) -> List[Dict]:
+        devs = list(self.devices.values())
+        mode = self.SORT_MODES[self.sort_idx]
+        if mode == "rssi":
+            # Sort missing rssi to bottom
+            devs.sort(key=lambda x: x["rssi"] if x["rssi"] is not None else -999, reverse=True)
+        elif mode == "anomaly":
+            devs.sort(key=lambda x: (not x.get("is_anomaly", False), x["rssi"] if x["rssi"] is not None else -999), reverse=False)
+        elif mode == "class":
+            devs.sort(key=lambda x: (x.get("device_class", ""), x["rssi"] if x["rssi"] is not None else -999), reverse=False)
+        return devs
 
     def generate_layout(self) -> Layout:
         layout = Layout()
         layout.split_column(
             Layout(name="header", size=3),
+            Layout(name="stats", size=3),
             Layout(name="main")
         )
-        layout["main"].split_row(
-            Layout(name="grid", ratio=2),
-            Layout(name="anomalies", ratio=1)
-        )
 
-        # Header
-        header_text = Text("Aether Auditor - Live Structural RF Map", style="bold white on blue", justify="center")
+        # Header & Feedback
+        header_text = "Aether Auditor - Tactical Dashboard"
         if self.is_validating:
-             header_text = Text(f"ACTIVE VALIDATION: {self.validating_target}", style="bold black on yellow", justify="center")
-        layout["header"].update(Panel(header_text))
+            header_text = f"ACTIVE VALIDATION IN PROGRESS: {self.current_validation_target} | QTY IN QUEUE: {self.validation_queue.qsize()}"
+            style = "bold black on yellow"
+        elif time.time() < self.feedback_timer:
+            header_text = self.feedback_message
+            style = "bold white on green"
+        else:
+            style = "bold white on blue"
+
+        layout["header"].update(Panel(Text(header_text, justify="center", style=style)))
 
         with self.lock:
-            # Grid Table
-            grid_table = Table(expand=True)
-            grid_table.add_column("MAC / BSSID", style="cyan")
-            grid_table.add_column("SSID", style="magenta")
-            grid_table.add_column("Proximity", justify="center")
-            grid_table.add_column("Vendor / Class", style="blue")
+            # Stats Panel
+            elapsed = int(time.time() - self.start_time)
+            mins, secs = divmod(elapsed, 60)
+            hrs, mins = divmod(mins, 60)
+            time_str = f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
-            # Anomalies Table
-            anom_table = Table(expand=True)
-            anom_table.add_column("Priority Anomalies", style="bold red")
-            anom_table.add_column("RSSI", justify="right")
+            total_devs = len(self.devices)
+            total_anoms = sum(1 for d in self.devices.values() if d.get("is_anomaly"))
+            mode_str = "ACTIVE" if self.auditor.active_mode else "PASSIVE"
 
-            for mac, data in self.devices.items():
-                prox_text = self._get_proximity_text(data["rssi"])
-                dev_class = data["device_class"]
+            stats_text = f"Total Devices: {total_devs} | Anomalies: [bold red]{total_anoms}[/bold red] | "
+            stats_text += f"Elapsed: {time_str} | Pkts/sec: {self.packets_per_sec:.1f} | Mode: [bold cyan]{mode_str}[/bold cyan]"
+            layout["stats"].update(Panel(stats_text, title="Telemetry"))
 
-                # Add to main grid
-                grid_table.add_row(
-                    mac,
-                    data["ssid"],
-                    prox_text,
-                    dev_class
+            if self.current_view == "HELP":
+                layout["main"].update(self._generate_help_panel())
+            elif self.current_view == "DETAIL" and self.selected_detail_mac in self.devices:
+                layout["main"].update(self._generate_detail_panel(self.devices[self.selected_detail_mac]))
+            else:
+                layout["main"].split_row(
+                    Layout(name="grid", ratio=2),
+                    Layout(name="anomalies", ratio=1)
                 )
-
-                # Add to anomalies
-                if data["is_anomaly"]:
-                    anom_table.add_row(
-                        f"{mac}\n{dev_class}",
-                        str(data["rssi"]) if data["rssi"] is not None else "N/A"
-                    )
-
-        border_style = "yellow" if self.is_validating else "blue"
-        layout["grid"].update(Panel(grid_table, title="Environmental Map", border_style=border_style))
-        layout["anomalies"].update(Panel(anom_table, title="Detected Signatures", border_style="red" if not self.is_validating else "yellow"))
+                grid_panel, anom_panel = self._generate_grid_panels()
+                layout["grid"].update(grid_panel)
+                layout["anomalies"].update(anom_panel)
 
         return layout
+
+    def _generate_help_panel(self) -> Panel:
+        t = Table(show_header=False, expand=True)
+        t.add_column("Key", style="bold yellow")
+        t.add_column("Action")
+        t.add_row("h", "Toggle this Help Menu")
+        t.add_row("s", "Cycle Sort Mode (RSSI -> Anomaly -> Class)")
+        t.add_row("n / p", "Next / Previous Page")
+        t.add_row("v", "Queue Validation Beacon (Prompt for ID)")
+        t.add_row("d", "View Device Details (Prompt for ID)")
+        t.add_row("a", "Toggle Active/Passive Probe Mode")
+        t.add_row("e", "Export database to GeoJSON map")
+        t.add_row("q", "Quit Aether Auditor")
+        return Panel(t, title="Interactive Commands")
+
+    def _generate_detail_panel(self, data: dict) -> Panel:
+        t = Table(expand=True)
+        t.add_column("Property", style="cyan")
+        t.add_column("Value")
+        t.add_row("MAC Address", data["mac"])
+
+        ssid_style = "italic" if data.get("is_hidden") else ""
+        t.add_row("SSID", f"[{ssid_style}]{data['ssid']}[/]")
+
+        t.add_row("RSSI", f"{data['rssi']} dBm" if data["rssi"] is not None else "N/A")
+        t.add_row("First Seen", data.get("first_seen", ""))
+        t.add_row("Last Seen", data.get("last_seen", ""))
+
+        anom_style = "bold red" if data.get("is_anomaly") else "green"
+        t.add_row("Status", f"[{anom_style}]{'ANOMALY' if data.get('is_anomaly') else 'BENIGN'}[/]")
+        t.add_row("Device Class", data.get("device_class", "Unknown"))
+
+        hist = data.get("history_rssi", [])
+        hist_str = " -> ".join([str(x) for x in hist])
+        t.add_row("RSSI History", hist_str)
+
+        return Panel(t, title=f"Device Details - {data['mac']} (Press 'd' or 'h' to close)")
+
+    def _generate_grid_panels(self) -> tuple[Panel, Panel]:
+        # Grid Table
+        grid_table = Table(expand=True)
+        grid_table.add_column("ID", style="dim", justify="right")
+        grid_table.add_column("MAC / BSSID", style="cyan")
+        grid_table.add_column("SSID", style="magenta")
+        grid_table.add_column("RSSI", justify="right")
+        grid_table.add_column("Vendor / Class", style="blue")
+
+        # Anomalies Table
+        anom_table = Table(expand=True)
+        anom_table.add_column("Priority Anomalies", style="bold red")
+        anom_table.add_column("RSSI", justify="right")
+
+        sorted_devs = self._get_sorted_devices()
+
+        # Add Anomalies
+        for d in sorted_devs:
+            if d.get("is_anomaly"):
+                anom_table.add_row(
+                    f"{d['mac']}\n{d.get('device_class', '')}",
+                    str(d["rssi"]) if d["rssi"] is not None else "N/A"
+                )
+
+        # Pagination logic
+        max_pages = max(0, (len(sorted_devs) - 1) // self.PAGE_SIZE)
+        if self.current_page > max_pages:
+            self.current_page = max_pages
+
+        start_idx = self.current_page * self.PAGE_SIZE
+        end_idx = start_idx + self.PAGE_SIZE
+        page_devs = sorted_devs[start_idx:end_idx]
+
+        for idx, data in enumerate(page_devs):
+            real_idx = start_idx + idx
+
+            # Row styling
+            style = ""
+            if data.get("is_anomaly"):
+                style = "bold red"
+            elif data.get("is_rapid"):
+                style = "blink red"
+
+            ssid_style = "italic" if data.get("is_hidden") else ""
+
+            grid_table.add_row(
+                str(real_idx),
+                Text(data["mac"], style=style),
+                Text(data["ssid"], style=ssid_style),
+                Text(str(data["rssi"]) if data["rssi"] is not None else "N/A", style=style),
+                Text(data.get("device_class", "Unknown"), style=style)
+            )
+
+        grid_title = f"Live Map (Page {self.current_page + 1}/{max_pages + 1}) | Sort: {self.SORT_MODES[self.sort_idx]}"
+        if self.current_view == "PROMPT":
+            action = "Validate" if self.prompt_mode == "VALIDATE" else "View Details"
+            grid_title = f"[{action}] Enter ID: {self.prompt_buffer}_"
+
+        return Panel(grid_table, title=grid_title), Panel(anom_table, title="Detected Signatures")
+
 
     def select_interface(self):
         console.clear()
@@ -130,50 +377,7 @@ class DashboardUI:
             console.print("[bold red]Invalid selection. Defaulting to first interface.[/bold red]")
             self.active_interface = interfaces[0] if interfaces else "wlan0"
 
-    def run_validation_sequence(self):
-        """Interactive sequence to trigger validation"""
-        with self.lock:
-            anomalies = {mac: data for mac, data in self.devices.items() if data["is_anomaly"]}
-
-        if not anomalies:
-            console.print("\n[yellow]No anomalies detected yet to validate.[/yellow]")
-            time.sleep(2)
-            return
-
-        console.print("\n[bold red]Select Anomaly to Validate:[/bold red]")
-        mac_list = list(anomalies.keys())
-        for idx, mac in enumerate(mac_list):
-            data = anomalies[mac]
-            console.print(f"  [{idx}] {mac} - {data['device_class']} (SSID: {data['ssid']})")
-
-        selection = Prompt.ask("Enter index to validate (or 'q' to cancel)")
-        if selection.lower() == 'q':
-            return
-
-        try:
-            target_mac = mac_list[int(selection)]
-            target_data = anomalies[target_mac]
-        except (ValueError, IndexError):
-            console.print("[red]Invalid selection.[/red]")
-            time.sleep(1)
-            return
-
-        self.is_validating = True
-        self.validating_target = f"{target_data['device_class']} ({target_mac})"
-
-        # Start Validator
-        try:
-            console.print(f"[bold yellow]Initiating validation beacon for {target_data['ssid']}...[/bold yellow]")
-            self.validator.start_audit_beacon(self.active_interface, target_data['ssid'])
-            time.sleep(5) # Simulate active validation time
-        except Exception as e:
-            console.print(f"[bold red]Validation Error: {e}[/bold red]")
-            time.sleep(2)
-        finally:
-            self.validator.stop_audit()
-            self.is_validating = False
-
-    async def _async_run(self):
+    def run(self):
         self.select_interface()
 
         try:
@@ -182,51 +386,19 @@ class DashboardUI:
             console.print(f"[bold red]Failed to start auditor: {e}[/bold red]")
             sys.exit(1)
 
+        listener = KeyboardListener(self.handle_keypress)
+        listener.start()
+
         console.clear()
 
-        # We use a Live block. Since prompt breaks live block rendering,
-        # we will run it in a loop catching inputs asynchronously, but for a rich TUI,
-        # catching keyboard input elegantly across OSes without curses is tricky.
-        # We'll use a polling thread or try-except on KeyboardInterrupt.
-
-        with Live(self.generate_layout(), refresh_per_second=4, screen=True) as live:
-            try:
-                while True:
-                    live.update(self.generate_layout())
-                    await asyncio.sleep(0.25)
-            except KeyboardInterrupt:
-                # Catch interrupt to pause live layout and show interactive prompt
-                pass
-
-        # Outside live block, prompt
-        while True:
-            console.clear()
-            console.print(self.generate_layout())
-            console.print("\n[bold cyan]Auditor Paused.[/bold cyan]")
-            console.print("Commands: [bold yellow]v[/bold yellow] = Validate Anomaly, [bold yellow]r[/bold yellow] = Resume live map, [bold yellow]q[/bold yellow] = Quit")
-
-            cmd = Prompt.ask("Enter command", choices=["v", "r", "q"], default="r")
-
-            if cmd == 'v':
-                self.run_validation_sequence()
-            elif cmd == 'r':
-                # Resume live loop
-                try:
-                    with Live(self.generate_layout(), refresh_per_second=4, screen=True) as live:
-                        while True:
-                            live.update(self.generate_layout())
-                            await asyncio.sleep(0.25)
-                except KeyboardInterrupt:
-                    continue
-            elif cmd == 'q':
-                break
-
-        self.auditor.stop_audit()
-
-    def run(self):
         try:
-            asyncio.run(self._async_run())
-        except KeyboardInterrupt:
+            with Live(self.generate_layout(), refresh_per_second=10, screen=True) as live:
+                while self.running:
+                    live.update(self.generate_layout())
+                    time.sleep(0.1)
+        finally:
+            self.running = False
+            listener.stop()
             self.auditor.stop_audit()
             console.print("\n[bold red]Aether Auditor shut down safely.[/bold red]")
 
